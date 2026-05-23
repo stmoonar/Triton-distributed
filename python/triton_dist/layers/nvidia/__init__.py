@@ -28,8 +28,9 @@ from .ep_a2a_layer import EPAll2AllLayer
 from .gemm_allreduce_layer import GemmARLayer
 from .ep_ll_a2a_layer import EPLowLatencyAllToAllLayer
 from .ulysses_sp_a2a_layer import UlyssesSPAllToAllLayer
+from .fp8_ep_moe import FP8_EP_MoE
 
 __all__ = [
     "SpGQAFlashDecodeAttention", "AllGatherLayer", "EPAll2AllLayer", "GemmARLayer", "EPLowLatencyAllToAllLayer",
-    "UlyssesSPAllToAllLayer"
+    "UlyssesSPAllToAllLayer", "FP8_EP_MoE"
 ]

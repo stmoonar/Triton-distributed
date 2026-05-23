@@ -84,6 +84,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
         self.topk = topk
         self.hidden = hidden
         self.dtype = dtype
+        self.compute_dtype = torch.bfloat16 if dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else dtype
         self.weight_dtype = weight_dtype
 
         assert num_tot_experts % world_size == 0
@@ -139,16 +140,24 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self._nvshmem_allocator.create_tensor(f"weight_recv_buffer_{i}", [math.ceil(avg_tokens * self.capacity)],
                                                   weight_dtype) for i in range(duplicate_comm_buffer)
         ]
+        self.input_scale_recv_buffers = [
+            self._nvshmem_allocator.create_tensor(f"input_scale_recv_buffer_{i}",
+                                                  [math.ceil(avg_tokens * self.capacity)], torch.float32)
+            for i in range(duplicate_comm_buffer)
+        ]
+        self.input_scale_send_buf = self._nvshmem_allocator.create_tensor("input_scale_send_buf",
+                                                                          [self.nnodes, max_tokens], torch.float32)
         self.send_buf = self.comm_buffers[self.current_comm_buffer_id]
         self.output_buf = self.output_buffers[self.current_comm_buffer_id]
         self.weight_recv_buf = self.weight_recv_buffers[self.current_comm_buffer_id]
+        self.input_scale_recv_buf = self.input_scale_recv_buffers[self.current_comm_buffer_id]
 
         # for combine comm
         self.combine_in_buf = self._nvshmem_allocator.create_tensor("combine_in_buf",
                                                                     [math.ceil(avg_tokens * self.capacity), hidden],
-                                                                    dtype)
+                                                                    self.compute_dtype)
         self.combine_out_buf = self._nvshmem_allocator.create_tensor("combine_out_buf",
-                                                                     [self.nnodes, max_tokens, hidden], dtype)
+                                                                     [self.nnodes, max_tokens, hidden], self.compute_dtype)
         self.combine_gate_in_buf = self._nvshmem_allocator.create_tensor("combine_gate_in_buf",
                                                                          [math.ceil(avg_tokens * self.capacity)],
                                                                          weight_dtype)
@@ -186,7 +195,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         # for combine
         self.intra_node_reduce_buf = self._nvshmem_allocator.create_tensor("intra_node_reduce_buf",
-                                                                           [self.nnodes, max_tokens, hidden], dtype)
+                                                                           [self.nnodes, max_tokens, hidden],
+                                                                           self.compute_dtype)
         self.intra_node_gate_buf = self._nvshmem_allocator.create_tensor("intra_node_gate_buf",
                                                                          [self.nnodes, max_tokens, topk], weight_dtype)
 
@@ -214,7 +224,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
             [self.max_tokens * self.topk * local_world_size, self.hidden // self.FWD_GEMM_BLOCK_SIZE_N],
             NVSHMEM_SIGNAL_DTYPE, fill_value=0)
         self.mega_combine_scatter_output_buf = self._nvshmem_allocator.create_tensor(
-            "mega_combine_scatter_output_buf", [self.max_tokens * self.topk, self.hidden], dtype)
+            "mega_combine_scatter_output_buf", [self.max_tokens * self.topk, self.hidden], self.compute_dtype)
         self.mega_combine_scatter_output_barrier_buf = self._nvshmem_allocator.create_tensor(
             "mega_combine_scatter_output_barrier_buf", [self.max_tokens * self.topk * self.local_world_size],
             torch.int32)
@@ -296,6 +306,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
         nvshmem_free_lazy_tensor(self.expert_indices_signal_buf)
         nvshmem_free_lazy_tensor(self.weight_send_buf)
         nvshmem_free_lazy_tensor(self.weight_recv_buf)
+        nvshmem_free_lazy_tensor(self.input_scale_send_buf)
+        nvshmem_free_lazy_tensor(self.input_scale_recv_buf)
         nvshmem_free_lazy_tensor(self.send_reqs_for_nodes)
         nvshmem_free_lazy_tensor(self.send_reqs_recv_bufs)
         nvshmem_free_lazy_tensor(self.send_buf)
@@ -338,7 +350,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
             )
             nvshmem_size_required = (alloc_token * self.hidden * self.dtype.itemsize * self.duplicate_comm_buffer +
                                      alloc_token * self.weight_dtype.itemsize * self.duplicate_comm_buffer +
-                                     alloc_token * self.hidden * self.dtype.itemsize +
+                                     alloc_token * torch.float32.itemsize * self.duplicate_comm_buffer +
+                                     alloc_token * self.hidden * self.compute_dtype.itemsize +
                                      alloc_token * self.weight_dtype.itemsize)
             print(
                 f"nvshmem_size_required: {nvshmem_size_required} bytes, allowing NVSHMEM_SYMMETRIC_SIZE is {os.environ.get('NVSHMEM_SYMMETRIC_SIZE', None)} bytes"
@@ -349,12 +362,17 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 self.output_buffers[i] = None
                 nvshmem_free_lazy_tensor(self.weight_recv_buffers[i])
                 self.weight_recv_buffers[i] = None
+                nvshmem_free_lazy_tensor(self.input_scale_recv_buffers[i])
+                self.input_scale_recv_buffers[i] = None
             del self.output_buffers
             del self.weight_recv_buffers
+            del self.input_scale_recv_buffers
             self.output_buf = None
             del self.output_buf
             self.weight_recv_buf = None
             del self.weight_recv_buf
+            self.input_scale_recv_buf = None
+            del self.input_scale_recv_buf
 
             nvshmem_free_lazy_tensor(self.combine_in_buf)
             del self.combine_in_buf
@@ -372,10 +390,15 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 self._nvshmem_allocator.create_tensor("weight_recv_buffers_{i}", [alloc_token], self.weight_dtype)
                 for i in range(self.duplicate_comm_buffer)
             ]
+            self.input_scale_recv_buffers = [
+                self._nvshmem_allocator.create_tensor("input_scale_recv_buffers_{i}", [alloc_token], torch.float32)
+                for i in range(self.duplicate_comm_buffer)
+            ]
             self.output_buf = self.output_buffers[self.current_comm_buffer_id]
             self.weight_recv_buf = self.weight_recv_buffers[self.current_comm_buffer_id]
+            self.input_scale_recv_buf = self.input_scale_recv_buffers[self.current_comm_buffer_id]
             self.combine_in_buf = self._nvshmem_allocator.create_tensor("combine_in_buf", [alloc_token, self.hidden],
-                                                                        self.dtype)
+                                                                        self.compute_dtype)
             self.combine_gate_in_buf = self._nvshmem_allocator.create_tensor("combine_gate_in_buf", [
                 alloc_token,
             ], self.weight_dtype)
@@ -564,6 +587,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
         gemm_tile_num_cum,
         gemm_num_tiles_total,
         gemm_expert_offs,
+        gemm_input_scale=None,
+        gemm_weight_scale=None,
 
         # dispatch token
         weight=None,
@@ -605,8 +630,23 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self.send_buf = self.comm_buffers[comm_buffer_id]
             self.output_buf = self.output_buffers[comm_buffer_id]
             self.weight_recv_buf = self.weight_recv_buffers[comm_buffer_id]
+            self.input_scale_recv_buf = self.input_scale_recv_buffers[comm_buffer_id]
         if with_cpy_flag:
             self.send_buf[self.node_id, :token_num].copy_(input)
+
+        use_fp8_scale = input.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+        if use_fp8_scale:
+            assert gemm_input_scale is not None, "gemm_input_scale is required for FP8 fused dispatch GEMM"
+            assert gemm_weight_scale is not None, "gemm_weight_scale is required for FP8 fused dispatch GEMM"
+            assert gemm_input_scale.shape[0] == token_num
+            assert gemm_input_scale.dtype == torch.float32
+            assert gemm_input_scale.is_contiguous()
+            assert gemm_weight_scale.dtype == torch.float32
+            assert gemm_weight_scale.is_contiguous()
+            self.input_scale_send_buf[self.node_id, :token_num].copy_(gemm_input_scale)
+        else:
+            gemm_input_scale = self.input_scale_recv_buf
+            gemm_weight_scale = gemm_weight
 
         has_weight = (weight is not None)
         if has_weight:
@@ -619,6 +659,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
         assert ep_a2a_layout_desc is not None
 
         dispatch_output_buf, weight_recv_buf = self.init_output_buffer(ep_a2a_layout_desc.num_recv_tokens_per_rank)
+        input_scale_recv_buf = self.input_scale_recv_buf[:dispatch_output_buf.shape[0]]
 
         grid = lambda meta: (self.MAX_SMS, )
         token_dst_scatter_idx = ep_a2a_layout_desc.token_dst_scatter_idx
@@ -651,7 +692,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
         )
 
         if gemm_output_data is None:
-            gemm_output_data = torch.empty([gemm_problem_shape[1], gemm_problem_shape[2]], dtype=gemm_input_data.dtype,
+            gemm_output_dtype = self.compute_dtype if gemm_input_data.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else gemm_input_data.dtype
+            gemm_output_data = torch.empty([gemm_problem_shape[1], gemm_problem_shape[2]], dtype=gemm_output_dtype,
                                            device=gemm_input_data.device)
         else:
             gemm_output_M_, gemm_output_N_ = gemm_output_data.shape
@@ -689,6 +731,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self.output_buf,
             self.weight_send_buf,
             self.weight_recv_buf,
+            self.input_scale_send_buf,
+            input_scale_recv_buf,
             ep_a2a_layout_desc.topk_indices_tensor,  # [nnodes, max_tokens, topk]
             token_dst_scatter_idx,  # [self.nnodes, self.max_tokens, self.topk]
             ep_a2a_layout_desc.num_input_tokens_per_rank,  # [world_size]
@@ -707,6 +751,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
             gemm_input_data,
             gemm_weight,
             gemm_output_data,
+            input_scale_recv_buf,
+            gemm_weight_scale,
             gemm_expert_ids,
             gemm_split_size,
             gemm_split_size_cum,
@@ -717,6 +763,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
             *gemm_problem_shape,
             *gemm_input_strides,
             *gemm_weight_strides,
+            gemm_weight_scale.stride(0) if use_fp8_scale else 0,
+            gemm_weight_scale.stride(1) if use_fp8_scale else 0,
             gemm_output_data.stride(0),
             gemm_output_data.stride(1),
             GROUP_GEMM_BLOCK_SIZE_M,
@@ -738,6 +786,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
             num_warps=num_warps,
             num_stages=gemm_num_stages,
             profiler_buffer=profiler_buffer,
+            USE_FP8=use_fp8_scale,
             ENABLE_PROFILING=enable_profiler,
         )
 
@@ -776,6 +825,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
         ep_a2a_layout_desc: EPAllToAllLayoutDesc,
 
         # group gemm
+        gemm_input_scale=None,
+        gemm_weight_scale=None,
         gemm_input_reduce_last_dim=True,
         gemm_weight_reduce_last_dim=True,
         gemm_BLOCK_SIZE_N: int = 256,
@@ -821,6 +872,19 @@ class EpAll2AllFusedOp(torch.nn.Module):
             gemm_weight_reduce_last_dim,
         )
         gemm_G, gemm_M, gemm_N, gemm_K = gemm_problem_shape
+        use_fp8_scale = gemm_input_data.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+        if use_fp8_scale:
+            assert gemm_input_scale is not None, "gemm_input_scale is required for FP8 fused combine GEMM"
+            assert gemm_weight_scale is not None, "gemm_weight_scale is required for FP8 fused combine GEMM"
+            assert gemm_input_scale.shape[0] >= gemm_M
+            assert gemm_input_scale.dtype == torch.float32
+            assert gemm_input_scale.is_contiguous()
+            assert gemm_weight_scale.shape == (gemm_G, gemm_N)
+            assert gemm_weight_scale.dtype == torch.float32
+            assert gemm_weight_scale.is_contiguous()
+        else:
+            gemm_input_scale = self.combine_gate_in_buf
+            gemm_weight_scale = gemm_weight
 
         # gemm output data is in combine buf
         gemm_output_data = self.combine_in_buf[:gemm_M, :].view(gemm_M, gemm_N)
@@ -913,6 +977,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 gemm_input_data,
                 gemm_weight,
                 gemm_output_data,
+                gemm_input_scale,
+                gemm_weight_scale,
                 gemm_expert_ids,
                 gemm_split_size,
                 gemm_split_size_cum,
@@ -924,6 +990,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 gemm_K,
                 *gemm_input_strides,
                 *gemm_weight_strides,
+                gemm_weight_scale.stride(0) if use_fp8_scale else 0,
+                gemm_weight_scale.stride(1) if use_fp8_scale else 0,
                 gemm_output_data.stride(0),
                 gemm_output_data.stride(1),
                 GROUP_GEMM_BLOCK_SIZE_M,
@@ -961,6 +1029,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 grid_barrier_workspace,
                 num_warps,
                 profiler_buffer,
+                USE_FP8=use_fp8_scale,
                 ENABLE_PROFILING=enable_profiler,
 
                 # num_warps=(num_scatter_warps + num_reduce_warps),
