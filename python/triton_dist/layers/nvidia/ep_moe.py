@@ -128,7 +128,7 @@ class EP_MoE:
             self.world_size,
             dtype=self.dtype,
             weight_dtype=torch.float32,
-            num_sm=64,
+            num_sm=110,
             num_buffers=1,
             capacity=4.0,
         )
