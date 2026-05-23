@@ -43,25 +43,63 @@ def _is_fp8_dtype(dtype: torch.dtype) -> bool:
     return dtype in FP8_DTYPES
 
 
-def _quantize_fp8_rowwise(tensor: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
+def _quantize_fp8_blockwise(tensor: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn,
+                            block_k: int = 128):
     assert _is_fp8_dtype(dtype)
     assert tensor.dim() == 2
+    assert tensor.shape[-1] % block_k == 0, f"K={tensor.shape[-1]} must be divisible by block_k={block_k}"
     finfo = torch.finfo(dtype)
-    tensor_fp32 = tensor.float()
+    m, k = tensor.shape
+    tensor_fp32 = tensor.float().reshape(m, k // block_k, block_k)
     amax = tensor_fp32.abs().amax(dim=-1)
     scale = torch.where(amax > 0, amax / finfo.max, torch.ones_like(amax)).to(torch.float32)
     q = torch.clamp(tensor_fp32 / scale.unsqueeze(-1), min=-finfo.max, max=finfo.max).to(dtype)
-    return q.contiguous(), scale.contiguous()
+    return q.reshape(m, k).contiguous(), scale.contiguous()
+
+
+def _quantize_fp8_weight_blockwise(tensor: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn,
+                                   block_n: int = 128, block_k: int = 128):
+    assert _is_fp8_dtype(dtype)
+    assert tensor.dim() == 3
+    e, n, k = tensor.shape
+    assert n % block_n == 0, f"N={n} must be divisible by block_n={block_n}"
+    assert k % block_k == 0, f"K={k} must be divisible by block_k={block_k}"
+    finfo = torch.finfo(dtype)
+    tensor_fp32 = tensor.float().reshape(e, n // block_n, block_n, k // block_k, block_k)
+    amax = tensor_fp32.abs().amax(dim=(2, 4))
+    scale = torch.where(amax > 0, amax / finfo.max, torch.ones_like(amax)).to(torch.float32)
+    q = torch.clamp(tensor_fp32 / scale[:, :, None, :, None], min=-finfo.max, max=finfo.max).to(dtype)
+    return q.reshape(e, n, k).contiguous(), scale.contiguous()
+
+
+def _quantize_fp8_rowwise(tensor: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
+    return _quantize_fp8_blockwise(tensor, dtype)
 
 
 def _quantize_fp8_last_dim(tensor: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
-    original_shape = tensor.shape
-    q, scale = _quantize_fp8_rowwise(tensor.reshape(-1, original_shape[-1]), dtype)
-    return q.reshape(original_shape).contiguous(), scale.reshape(original_shape[:-1]).contiguous()
+    if tensor.dim() == 3:
+        return _quantize_fp8_weight_blockwise(tensor, dtype)
+    return _quantize_fp8_blockwise(tensor, dtype)
 
 
 def _dequantize_fp8_last_dim(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return (tensor.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+    tensor_fp32 = tensor.float()
+    if tensor.dim() == 2 and scale.dim() == 2 and scale.shape[0] == tensor.shape[0]:
+        block_k = tensor.shape[1] // scale.shape[1]
+        return (tensor_fp32.reshape(tensor.shape[0], scale.shape[1], block_k) * scale[:, :, None]).reshape_as(tensor).to(
+            torch.bfloat16)
+    if tensor.dim() == 2 and scale.dim() == 2:
+        block_n = tensor.shape[0] // scale.shape[0]
+        block_k = tensor.shape[1] // scale.shape[1]
+        return (tensor_fp32.reshape(scale.shape[0], block_n, scale.shape[1], block_k) *
+                scale[:, None, :, None]).reshape_as(tensor).to(torch.bfloat16)
+    if tensor.dim() == 3 and scale.dim() == 3:
+        block_n = tensor.shape[1] // scale.shape[1]
+        block_k = tensor.shape[2] // scale.shape[2]
+        return (tensor_fp32.reshape(tensor.shape[0], scale.shape[1], block_n, scale.shape[2], block_k) *
+                scale[:, :, None, :, None]).reshape_as(tensor).to(torch.bfloat16)
+    raise ValueError(f"Unsupported FP8 dequant shapes: tensor={tuple(tensor.shape)}, scale={tuple(scale.shape)}")
+
 
 
 def _all_to_all_single(output: torch.Tensor, input: torch.Tensor, group: dist.ProcessGroup, output_split_sizes=None,
@@ -80,8 +118,8 @@ class FP8_EP_MoE:
     """Inference-only EP MoE with FP8 dispatch tokens and FP8 expert GEMMs.
 
     The implementation mirrors the reference EP MoE dispatch/combine order, but stores
-    expert weights in FP8 and uses row-wise activation scales plus per-output-channel
-    weight scales for both grouped GEMMs.
+    expert weights in FP8 and uses block-wise activation/weight scales for both grouped GEMMs.
+
     """
 
     def __init__(self, rank=0, world_size=8, group: Optional[dist.ProcessGroup] = None,
@@ -156,7 +194,8 @@ class FP8_EP_MoE:
             self.world_size,
             dtype=self.fp8_dtype,
             weight_dtype=torch.float32,
-            num_sm=64,
+            num_sm=110,
+
             num_buffers=1,
             capacity=4.0,
         )

@@ -125,6 +125,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         self.capacity = capacity
         self.FWD_GEMM_BLOCK_SIZE_N = FWD_GEMM_BLOCK_SIZE_N
+        self.FP8_BLOCK_SIZE_N = 128
+        self.FP8_BLOCK_SIZE_K = 128
+        self.num_input_scale_groups = triton.cdiv(hidden, self.FP8_BLOCK_SIZE_K)
         self.need_reversed_token_scatter_idx = need_reversed_token_scatter_idx
 
         # for dispatch comm
@@ -141,12 +144,13 @@ class EpAll2AllFusedOp(torch.nn.Module):
                                                   weight_dtype) for i in range(duplicate_comm_buffer)
         ]
         self.input_scale_recv_buffers = [
-            self._nvshmem_allocator.create_tensor(f"input_scale_recv_buffer_{i}",
-                                                  [math.ceil(avg_tokens * self.capacity)], torch.float32)
+            self._nvshmem_allocator.create_tensor(
+                f"input_scale_recv_buffer_{i}",
+                [math.ceil(avg_tokens * self.capacity), self.num_input_scale_groups], torch.float32)
             for i in range(duplicate_comm_buffer)
         ]
-        self.input_scale_send_buf = self._nvshmem_allocator.create_tensor("input_scale_send_buf",
-                                                                          [self.nnodes, max_tokens], torch.float32)
+        self.input_scale_send_buf = self._nvshmem_allocator.create_tensor(
+            "input_scale_send_buf", [self.nnodes, max_tokens, self.num_input_scale_groups], torch.float32)
         self.send_buf = self.comm_buffers[self.current_comm_buffer_id]
         self.output_buf = self.output_buffers[self.current_comm_buffer_id]
         self.weight_recv_buf = self.weight_recv_buffers[self.current_comm_buffer_id]
@@ -350,7 +354,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
             )
             nvshmem_size_required = (alloc_token * self.hidden * self.dtype.itemsize * self.duplicate_comm_buffer +
                                      alloc_token * self.weight_dtype.itemsize * self.duplicate_comm_buffer +
-                                     alloc_token * torch.float32.itemsize * self.duplicate_comm_buffer +
+                                     alloc_token * self.num_input_scale_groups * torch.float32.itemsize * self.duplicate_comm_buffer +
                                      alloc_token * self.hidden * self.compute_dtype.itemsize +
                                      alloc_token * self.weight_dtype.itemsize)
             print(
@@ -391,7 +395,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 for i in range(self.duplicate_comm_buffer)
             ]
             self.input_scale_recv_buffers = [
-                self._nvshmem_allocator.create_tensor("input_scale_recv_buffers_{i}", [alloc_token], torch.float32)
+                self._nvshmem_allocator.create_tensor("input_scale_recv_buffers_{i}",
+                                                     [alloc_token, self.num_input_scale_groups], torch.float32)
                 for i in range(self.duplicate_comm_buffer)
             ]
             self.output_buf = self.output_buffers[self.current_comm_buffer_id]
@@ -638,9 +643,12 @@ class EpAll2AllFusedOp(torch.nn.Module):
         if use_fp8_scale:
             assert gemm_input_scale is not None, "gemm_input_scale is required for FP8 fused dispatch GEMM"
             assert gemm_weight_scale is not None, "gemm_weight_scale is required for FP8 fused dispatch GEMM"
-            assert gemm_input_scale.shape[0] == token_num
+            assert gemm_input_scale.shape == (token_num, self.num_input_scale_groups)
             assert gemm_input_scale.dtype == torch.float32
             assert gemm_input_scale.is_contiguous()
+            assert gemm_weight_scale.shape == (gemm_weight.shape[0],
+                                               triton.cdiv(gemm_weight.shape[1], self.FP8_BLOCK_SIZE_N),
+                                               triton.cdiv(gemm_weight.shape[2], self.FP8_BLOCK_SIZE_K))
             assert gemm_weight_scale.dtype == torch.float32
             assert gemm_weight_scale.is_contiguous()
             self.input_scale_send_buf[self.node_id, :token_num].copy_(gemm_input_scale)
@@ -741,6 +749,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self.topk,
             self.hidden,
             self.experts_per_rank,
+            self.num_input_scale_groups,
             has_weight,  # HAS_WEIGHT
             with_scatter_indices,  # WITH_SCATTER_INDICES
 
@@ -763,13 +772,18 @@ class EpAll2AllFusedOp(torch.nn.Module):
             *gemm_problem_shape,
             *gemm_input_strides,
             *gemm_weight_strides,
+            input_scale_recv_buf.stride(0) if use_fp8_scale else 0,
+            input_scale_recv_buf.stride(1) if use_fp8_scale else 0,
             gemm_weight_scale.stride(0) if use_fp8_scale else 0,
             gemm_weight_scale.stride(1) if use_fp8_scale else 0,
+            gemm_weight_scale.stride(2) if use_fp8_scale else 0,
             gemm_output_data.stride(0),
             gemm_output_data.stride(1),
             GROUP_GEMM_BLOCK_SIZE_M,
             gemm_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K,
+            self.FP8_BLOCK_SIZE_N,
+            self.FP8_BLOCK_SIZE_K,
             gemm_GROUP_SIZE_M,
 
             # dispatch local output
@@ -877,9 +891,11 @@ class EpAll2AllFusedOp(torch.nn.Module):
             assert gemm_input_scale is not None, "gemm_input_scale is required for FP8 fused combine GEMM"
             assert gemm_weight_scale is not None, "gemm_weight_scale is required for FP8 fused combine GEMM"
             assert gemm_input_scale.shape[0] >= gemm_M
+            assert gemm_input_scale.shape[1] == triton.cdiv(gemm_K, self.FP8_BLOCK_SIZE_K)
             assert gemm_input_scale.dtype == torch.float32
             assert gemm_input_scale.is_contiguous()
-            assert gemm_weight_scale.shape == (gemm_G, gemm_N)
+            assert gemm_weight_scale.shape == (gemm_G, triton.cdiv(gemm_N, self.FP8_BLOCK_SIZE_N),
+                                               triton.cdiv(gemm_K, self.FP8_BLOCK_SIZE_K))
             assert gemm_weight_scale.dtype == torch.float32
             assert gemm_weight_scale.is_contiguous()
         else:
@@ -990,13 +1006,18 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 gemm_K,
                 *gemm_input_strides,
                 *gemm_weight_strides,
+                gemm_input_scale.stride(0) if use_fp8_scale else 0,
+                gemm_input_scale.stride(1) if use_fp8_scale else 0,
                 gemm_weight_scale.stride(0) if use_fp8_scale else 0,
                 gemm_weight_scale.stride(1) if use_fp8_scale else 0,
+                gemm_weight_scale.stride(2) if use_fp8_scale else 0,
                 gemm_output_data.stride(0),
                 gemm_output_data.stride(1),
                 GROUP_GEMM_BLOCK_SIZE_M,
                 gemm_BLOCK_SIZE_N,
                 gemm_BLOCK_SIZE_K,
+                self.FP8_BLOCK_SIZE_N,
+                self.FP8_BLOCK_SIZE_K,
                 gemm_GROUP_SIZE_M,
 
                 # combine token params
@@ -1112,6 +1133,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 grid_barrier_workspace,
                 num_warps,
                 profiler_buffer,
+                USE_FP8=use_fp8_scale,
                 ENABLE_PROFILING=enable_profiler,
                 num_warps=num_warps,
                 num_stages=gemm_num_stages,

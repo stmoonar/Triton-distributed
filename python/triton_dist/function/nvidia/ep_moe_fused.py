@@ -39,13 +39,16 @@ from .common import (custom_fwd, custom_bwd, init_triton_dist_ep_ctx, get_moe_op
                      get_triton_dist_moe_profile_enabled)
 
 
-def _quantize_fp8_rowwise(tensor: torch.Tensor, dtype: torch.dtype):
+def _quantize_fp8_blockwise(tensor: torch.Tensor, dtype: torch.dtype, block_k: int = 128):
     finfo = torch.finfo(dtype)
-    tensor_fp32 = tensor.float()
+    assert tensor.dim() == 2
+    assert tensor.shape[-1] % block_k == 0, f"K={tensor.shape[-1]} must be divisible by block_k={block_k}"
+    m, k = tensor.shape
+    tensor_fp32 = tensor.float().reshape(m, k // block_k, block_k)
     amax = tensor_fp32.abs().amax(dim=-1)
     scale = torch.where(amax > 0, amax / finfo.max, torch.ones_like(amax)).to(torch.float32)
     q = torch.clamp(tensor_fp32 / scale.unsqueeze(-1), min=-finfo.max, max=finfo.max).to(dtype)
-    return q.contiguous(), scale.contiguous()
+    return q.reshape(m, k).contiguous(), scale.contiguous()
 
 
 class TritonDistFusedEpMoeFunction(torch.autograd.Function):
@@ -461,7 +464,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
 
         triton_dist_ep_ctx.ep_a2a_layout_desc = dispatch_layout_desc
         swiglu_output, _ = swiglu_forward(fc1_output, scale=dispatch_weight_in_buf.view(-1))
-        swiglu_output_fp8, swiglu_output_scale = _quantize_fp8_rowwise(swiglu_output, fp8_dtype)
+        swiglu_output_fp8, swiglu_output_scale = _quantize_fp8_blockwise(swiglu_output, fp8_dtype)
 
         combine_output = triton_dist_ep_ctx.ep_op.mega_group_gemm_combine(
             gemm_input_data=swiglu_output_fp8,

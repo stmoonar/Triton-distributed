@@ -93,6 +93,7 @@ def tile_kernel_dispatch_token_intra_node(
     HAS_WEIGHT: tl.constexpr,
     WITH_SCATTER_INDICES: tl.constexpr,
     HAS_INPUT_SCALE: tl.constexpr,
+    INPUT_SCALE_GROUPS: tl.constexpr,
     num_warps: tl.constexpr,
     profiler: Profiler,
     ENABLE_PROFILING: tl.constexpr,
@@ -138,8 +139,9 @@ def tile_kernel_dispatch_token_intra_node(
                 libshmem_device.putmem_warp(weight_recv_buf + store_idx, weight_send_buf + sort_token_offset,
                                             weight_elem_size, expert_rank)
             if HAS_INPUT_SCALE:
-                libshmem_device.putmem_warp(input_scale_recv_buf + store_idx, input_scale_send_buf + token_offset, 4,
-                                            expert_rank)
+                libshmem_device.putmem_warp(input_scale_recv_buf + store_idx * INPUT_SCALE_GROUPS,
+                                            input_scale_send_buf + token_offset * INPUT_SCALE_GROUPS,
+                                            4 * INPUT_SCALE_GROUPS, expert_rank)
             sync_warp()
             if lane_idx == 0:
                 tokens_this_expert = ld(local_splits_buf + expert_idx)
@@ -204,6 +206,7 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
     HAS_WEIGHT: tl.constexpr,
     WITH_SCATTER_INDICES: tl.constexpr,
     HAS_INPUT_SCALE: tl.constexpr,
+    INPUT_SCALE_GROUPS: tl.constexpr,
     USE_BLOCK_WISE_BARRIER: tl.constexpr,
     num_warps: tl.constexpr,
     num_tail_sms: tl.constexpr,
@@ -249,8 +252,9 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                     libshmem_device.putmem_warp(weight_recv_buf + store_idx, weight_send_buf + sort_token_offset,
                                                 weight_elem_size, expert_rank)
                 if HAS_INPUT_SCALE:
-                    libshmem_device.putmem_warp(input_scale_recv_buf + store_idx, input_scale_send_buf + token_offset, 4,
-                                                expert_rank)
+                    libshmem_device.putmem_warp(input_scale_recv_buf + store_idx * INPUT_SCALE_GROUPS,
+                                                input_scale_send_buf + token_offset * INPUT_SCALE_GROUPS,
+                                                4 * INPUT_SCALE_GROUPS, expert_rank)
 
                 src_ptr = input_buf + token_offset * hidden_size
                 dst_ptr = output_buf + store_idx.to(tl.int64) * hidden_size
@@ -289,6 +293,9 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                         has_sent = ld_acquire(token_indirect_pos_buf + real_offset, scope="sys")
                     copy_warp(dispatch_output_local + real_offset * hidden_size, output_buf + has_sent * hidden_size,
                               bytes_per_token)
+                    if HAS_INPUT_SCALE:
+                        copy_warp(input_scale_recv_buf + real_offset * INPUT_SCALE_GROUPS,
+                                  input_scale_recv_buf + has_sent * INPUT_SCALE_GROUPS, 4 * INPUT_SCALE_GROUPS)
                 __syncthreads()
                 if thread_idx == 0:
                     st(barriers_ptr + tile_id, 1, scope="gpu", semantic="release")
@@ -307,6 +314,9 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
                     #     copy_warp(output_buf + real_offset * hidden_size, output_buf + has_sent * hidden_size, bytes_per_token)
                     copy_warp(dispatch_output_local + real_offset * hidden_size, output_buf + has_sent * hidden_size,
                               bytes_per_token)
+                    if HAS_INPUT_SCALE:
+                        copy_warp(input_scale_recv_buf + real_offset * INPUT_SCALE_GROUPS,
+                                  input_scale_recv_buf + has_sent * INPUT_SCALE_GROUPS, 4 * INPUT_SCALE_GROUPS)
                 __syncthreads()
                 if thread_idx == 0:
                     st(barriers_ptr + expert_idx, 1, scope="gpu", semantic="release")
@@ -581,9 +591,13 @@ def dot_k_const(
     K: tl.constexpr,
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
+    stride_ask: tl.constexpr,
+    stride_bsk: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    FP8_BLOCK_N: tl.constexpr,
+    FP8_BLOCK_K: tl.constexpr,
     need_mask: tl.constexpr,
     USE_FP8: tl.constexpr,
 ):
@@ -597,14 +611,19 @@ def dot_k_const(
             a = tl.load(a_ptrs, mask=(k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K) < K)[None, :])
         b = tl.load(b_ptrs, mask=(k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K) < K)[:, None])
 
-        accumulator = tl.dot(a, b, accumulator)
+        dot = tl.dot(a, b)
+        if USE_FP8:
+            k_scale_idx = (k * BLOCK_SIZE_K) // FP8_BLOCK_K
+
+            a_scale = tl.load(a_scale_ptrs + k_scale_idx * stride_ask,
+                              mask=tl.arange(0, BLOCK_SIZE_M) < M, other=1.0).to(tl.float32)
+            b_scale = tl.load(b_scale_ptrs + k_scale_idx * stride_bsk,
+                              mask=tl.arange(0, BLOCK_SIZE_N) < N, other=1.0).to(tl.float32)
+            dot = dot * a_scale[:, None] * b_scale[None, :]
+        accumulator += dot
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if USE_FP8:
-        a_scale = tl.load(a_scale_ptrs, mask=tl.arange(0, BLOCK_SIZE_M) < M, other=1.0).to(tl.float32)
-        b_scale = tl.load(b_scale_ptrs, mask=tl.arange(0, BLOCK_SIZE_N) < N, other=1.0).to(tl.float32)
-        accumulator = accumulator * a_scale[:, None] * b_scale[None, :]
     accumulator = accumulator.to(c_ptrs.dtype.element_ty)
     if need_mask:
         c_mask = (tl.arange(0, BLOCK_SIZE_M) < M)[:, None] & (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
@@ -612,6 +631,9 @@ def dot_k_const(
     else:
         c_mask = (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
         tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+
 
 
 @triton_dist.jit(do_not_specialize=["pid", "num_pid", "M"])
@@ -639,14 +661,20 @@ def tile_kernel_moe_grouped_gemm_nk_const(
     stride_be,
     stride_bn,
     stride_bk,
+    stride_asm,
+    stride_ask,
     stride_bse,
     stride_bsn,
+    stride_bsk,
     stride_cm,
     stride_cn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    FP8_BLOCK_N: tl.constexpr,
+    FP8_BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+
     profiler: Profiler,
     NEED_WAIT: tl.constexpr,
     NEED_NOTIFY: tl.constexpr,
@@ -711,8 +739,10 @@ def tile_kernel_moe_grouped_gemm_nk_const(
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = (c_ptr + offs_token[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    a_scale_ptrs = a_scale_ptr + offs_token
-    b_scale_ptrs = b_scale_ptr + expert_id.to(tl.int64) * stride_bse + offs_bn * stride_bsn
+    a_scale_ptrs = a_scale_ptr + offs_token * stride_asm
+    b_scale_ptrs = (b_scale_ptr + expert_id.to(tl.int64) * stride_bse +
+                    (offs_bn // FP8_BLOCK_N) * stride_bsn)
+
 
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=3)
@@ -720,12 +750,13 @@ def tile_kernel_moe_grouped_gemm_nk_const(
 
     if row_remain >= BLOCK_SIZE_M:
         dot_k_const(a_ptrs, b_ptrs, c_ptrs, a_scale_ptrs, b_scale_ptrs, row_remain,
-                    min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak, stride_bk, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                    BLOCK_SIZE_K, False, USE_FP8)
+                    min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak, stride_bk, stride_ask, stride_bsk,
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, FP8_BLOCK_N, FP8_BLOCK_K, False, USE_FP8)
     elif row_remain > 0:
         dot_k_const(a_ptrs, b_ptrs, c_ptrs, a_scale_ptrs, b_scale_ptrs, row_remain,
-                    min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak, stride_bk, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                    BLOCK_SIZE_K, True, USE_FP8)
+                    min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak, stride_bk, stride_ask, stride_bsk,
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, FP8_BLOCK_N, FP8_BLOCK_K, True, USE_FP8)
+
 
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=4)
@@ -884,10 +915,12 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
     topk: tl.constexpr,
     hidden_size: tl.constexpr,
     experts_per_rank: tl.constexpr,
+    INPUT_SCALE_GROUPS: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     WITH_SCATTER_INDICES: tl.constexpr,
 
     #
+
     num_dispatch_tasks: tl.constexpr,
 
     # grouped gemm params
@@ -912,16 +945,22 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
     stride_be,
     stride_bn,
     stride_bk,
+    stride_asm,
+    stride_ask,
     stride_bse,
     stride_bsn,
+    stride_bsk,
     stride_cm,
     stride_cn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    FP8_BLOCK_N: tl.constexpr,
+    FP8_BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 
     # checkpoint params
+
     dispatch_output_local,
 
     #
@@ -983,7 +1022,9 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
                     HAS_WEIGHT,
                     WITH_SCATTER_INDICES,
                     USE_FP8,
+                    INPUT_SCALE_GROUPS,
                     USE_BLOCK_WISE_BARRIER,
+
                     NUM_WARPS,
                     NUM_TAIL_SMS,
                     profiler,
@@ -1013,7 +1054,9 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
                     HAS_WEIGHT,
                     WITH_SCATTER_INDICES,
                     USE_FP8,
+                    INPUT_SCALE_GROUPS,
                     NUM_WARPS,
+
                     profiler,
                     ENABLE_PROFILING,
                 )
@@ -1043,16 +1086,22 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
                 stride_be,
                 stride_bn,
                 stride_bk,
+                stride_asm,
+                stride_ask,
                 stride_bse,
                 stride_bsn,
+                stride_bsk,
                 stride_cm,
                 stride_cn,
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_K,
+                FP8_BLOCK_N,
+                FP8_BLOCK_K,
                 GROUP_SIZE_M,
                 profiler,
                 NEED_WAIT=True,
+
                 NEED_NOTIFY=False,
                 USE_BLOCK_WISE_BARRIER=USE_BLOCK_WISE_BARRIER,
                 IS_DISPATCH_TWO_STAGET=NUM_TAIL_SMS > 0,
@@ -1086,16 +1135,22 @@ def mega_kernel_moe_grouped_gemm_combine_token(
     stride_be,
     stride_bn,
     stride_bk,
+    stride_asm,
+    stride_ask,
     stride_bse,
     stride_bsn,
+    stride_bsk,
     stride_cm,
     stride_cn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    FP8_BLOCK_N: tl.constexpr,
+    FP8_BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 
     # combine token params
+
     num_input_tokens_per_rank,  # [world_size]
     num_recv_tokens_per_rank,  # [world_size]
     input_buf,  # symm buffer (recv token in dispatch stage)
@@ -1167,13 +1222,18 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                 stride_be,
                 stride_bn,
                 stride_bk,
+                stride_asm,
+                stride_ask,
                 stride_bse,
                 stride_bsn,
+                stride_bsk,
                 stride_cm,
                 stride_cn,
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_K,
+                FP8_BLOCK_N,
+                FP8_BLOCK_K,
                 GROUP_SIZE_M,
                 profiler,
                 NEED_WAIT=False,
