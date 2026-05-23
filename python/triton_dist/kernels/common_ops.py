@@ -50,7 +50,7 @@ pack_b32_v2 = pack_b32_v2_nv if is_cuda() else pack_b32_v2_amd
 
 if is_cuda():
     from triton_dist.language.extra.cuda.language_extra import globaltimer as cuda_globaltimer, globaltimer_lo as cuda_globaltimer_lo
-    from triton_dist.language.extra.cuda.language_extra import __fence as fence_nv
+    from triton_dist.language.extra.cuda.language_extra import fence as fence_nv
     from triton.language.extra.cuda import smid
 elif is_hip():
     from triton_dist.language.extra.hip.language_extra import wallclock, smid
