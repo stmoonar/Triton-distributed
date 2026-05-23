@@ -99,7 +99,8 @@ def tile_kernel_dispatch_token_intra_node(
     ENABLE_PROFILING: tl.constexpr,
 ):
     weight_elem_size = 4
-    bytes_per_token = 2 * hidden_size
+    elem_size: tl.constexpr = tl.constexpr(input_buf.dtype.element_ty.primitive_bitwidth) // 8
+    bytes_per_token = elem_size * hidden_size
 
     WARP_SIZE = 32
     rank = dl.rank()
@@ -214,7 +215,8 @@ def tile_kernel_dispatch_token_intra_node_two_stage(
     ENABLE_PROFILING: tl.constexpr,
 ):
     weight_elem_size = 4
-    bytes_per_token = 2 * hidden_size
+    elem_size: tl.constexpr = tl.constexpr(input_buf.dtype.element_ty.primitive_bitwidth) // 8
+    bytes_per_token = elem_size * hidden_size
     num_pid -= num_tail_sms
 
     WARP_SIZE = 32
