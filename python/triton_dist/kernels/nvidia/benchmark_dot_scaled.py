@@ -20,7 +20,9 @@ import traceback
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 import numpy as np
+
 
 
 
@@ -283,68 +285,74 @@ def matmul_mxfp8_dot_scaled_kernel(
 # ============================================================
 @triton.jit
 def matmul_mxfp8_dot_scaled_tma_kernel(
-    a_desc, b_desc, c_desc,
-    a_scale_ptr, b_scale_ptr,
-    M, N, K,
-    stride_asm, stride_ask,
-    stride_bsn, stride_bsk,
+    a_desc,
+    a_scale_desc,
+    b_desc,
+    b_scale_desc,
+    c_desc,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_SCALE_K: tl.constexpr,
     VEC_SIZE: tl.constexpr,
+    REP_M: tl.constexpr,
+    REP_N: tl.constexpr,
+    REP_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
-
     """
-    MXFP8 GEMM using tl.dot_scaled with TMA descriptors for data tiles.
-    B descriptor is physical [N, K]; kernel passes b.T as logical rhs [K, N].
-    Scale is still loaded via tl.load (simpler than 5D packed layout).
+    MXFP8 GEMM using tl.dot_scaled with TensorDescriptor data loads and official
+    NVIDIA packed 5D scale layout.
+
+    Physical layouts:
+      A: [M, K]
+      B: [N, K], passed as b.T to dot_scaled logical rhs [K, N]
+      scale: [1, ceil(dim/128), K//VEC_SIZE//4, 2, 256]
     """
-    tl.static_assert(BLOCK_SIZE_K == BLOCK_SIZE_SCALE_K * VEC_SIZE)
+    tl.static_assert(BLOCK_SIZE_M == REP_M * 128)
+    tl.static_assert(BLOCK_SIZE_N == REP_N * 128)
+    tl.static_assert(BLOCK_SIZE_K == REP_K * VEC_SIZE * 4)
 
-    pid_m = tl.program_id(0)
-
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-    num_scale_per_block: tl.constexpr = BLOCK_SIZE_SCALE_K
-    offs_scale_k = tl.arange(0, BLOCK_SIZE_SCALE_K)
-
-
-    a_scale_base = a_scale_ptr + offs_m[:, None] * stride_asm
-    b_scale_base = b_scale_ptr + offs_n[:, None] * stride_bsn
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    pid_m = pid % num_pid_m
+    pid_n = pid // num_pid_m
 
     offs_am = pid_m * BLOCK_SIZE_M
     offs_bn = pid_n * BLOCK_SIZE_N
+    offs_k = 0
+    offs_scale_m = pid_m * REP_M
+    offs_scale_n = pid_n * REP_N
+    offs_scale_k = 0
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # TMA loads: a=[BLOCK_M, BLOCK_K], physical b=[BLOCK_N, BLOCK_K]
-        a = a_desc.load([offs_am, k * BLOCK_SIZE_K])
-        b = b_desc.load([offs_bn, k * BLOCK_SIZE_K])
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+    for _ in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=NUM_STAGES):
+        a = a_desc.load([offs_am, offs_k])
+        b = b_desc.load([offs_bn, offs_k])
+        a_scale = a_scale_desc.load([0, offs_scale_m, offs_scale_k, 0, 0])
+        b_scale = b_scale_desc.load([0, offs_scale_n, offs_scale_k, 0, 0])
 
-        # Load scales via tl.load
-        scale_k_offset = k * num_scale_per_block
-        a_scale = tl.load(
-            a_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_ask
+        a_scale = a_scale.reshape(REP_M, REP_K, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(
+            BLOCK_SIZE_M, BLOCK_SIZE_K // VEC_SIZE
         )
-        b_scale = tl.load(
-            b_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_bsk
+        b_scale = b_scale.reshape(REP_N, REP_K, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(
+            BLOCK_SIZE_N, BLOCK_SIZE_K // VEC_SIZE
         )
 
-        # rhs is b.T -> [BLOCK_K, BLOCK_N], rhs_scale is [BLOCK_N, BLOCK_K//32]
         accumulator = tl.dot_scaled(
             a, a_scale, "e4m3",
             b.T, b_scale, "e4m3",
             accumulator
         )
 
+        offs_k += BLOCK_SIZE_K
+        offs_scale_k += REP_K
 
     c_desc.store([offs_am, offs_bn], accumulator.to(tl.bfloat16))
+
 
 
 # ============================================================
@@ -429,51 +437,63 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                     )
 
             elif variant == "mxfp8_dot_scaled":
-                # MXFP8 with tl.dot_scaled
-                # A: [M, K] in float8_e4m3fn
-                # B: [N, K] in float8_e4m3fn, passed as b.T to dot_scaled logical rhs=[K,N]
-                # a_scale: [M, K//32] in uint8 (E8M0)
-                # b_scale: [N, K//32] in uint8 (E8M0) - shape is [N, K//32]!
+                # MXFP8 with tl.dot_scaled, TensorDescriptor data loads, and official
+                # NVIDIA packed 5D scale layout.
+                # A: [M, K]
+                # B: [N, K], passed as b.T to dot_scaled logical rhs=[K,N]
+                # scale: [1, dim//128, K//32//4, 2, 256] in uint8 E8M0
+                vec_size = 32
+                if block_m % 128 != 0 or block_n % 128 != 0 or block_k % (vec_size * 4) != 0:
+                    results[name] = {
+                        "error": "SKIP: packed scale path requires BLOCK_M/BLOCK_N multiples of 128 and BLOCK_K multiple of 128"
+                    }
+                    continue
+                if M % block_m != 0 or N % block_n != 0 or K % block_k != 0:
+                    results[name] = {
+                        "error": "SKIP: TensorDescriptor path currently requires M/N/K divisible by block sizes"
+                    }
+                    continue
+
                 a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
                 b_nk = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
                 c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 
-                vec_size = 32
-                block_size_scale_k = block_k // vec_size
-                num_scale_k = K // vec_size  # K must be divisible by 32
+                rep_m = block_m // 128
+                rep_n = block_n // 128
+                rep_k = block_k // vec_size // 4
+                scale_k_chunks = K // vec_size // 4
 
-                # E8M0 scale = 127 means scale factor = 1.0
-                a_scale = torch.full((M, num_scale_k), 127, device="cuda", dtype=torch.uint8)
-                b_scale = torch.full((N, num_scale_k), 127, device="cuda", dtype=torch.uint8)
+                # Packed scale layout from Triton's block-scaled matmul tutorial.
+                # E8M0 scale = 127 means scale factor = 1.0.
+                a_scale = torch.full((1, M // 128, scale_k_chunks, 2, 256), 127, device="cuda", dtype=torch.uint8)
+                b_scale = torch.full((1, N // 128, scale_k_chunks, 2, 256), 127, device="cuda", dtype=torch.uint8)
 
-                grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+                a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+                b_desc = TensorDescriptor(b_nk, b_nk.shape, b_nk.stride(), [block_n, block_k])
+                c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+                scale_block_shape_a = [1, rep_m, rep_k, 2, 256]
+                scale_block_shape_b = [1, rep_n, rep_k, 2, 256]
+                a_scale_desc = TensorDescriptor(a_scale, a_scale.shape, a_scale.stride(), scale_block_shape_a)
+                b_scale_desc = TensorDescriptor(b_scale, b_scale.shape, b_scale.stride(), scale_block_shape_b)
 
-                # Skip if K is not divisible by block_k (dot_scaled doesn't support masks)
-                if K % block_k != 0:
-                    results[name] = {"error": "K not divisible by BLOCK_K"}
-                    continue
+                grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), )
 
-                def run_fn(kernel_fn=kernel_fn, a=a, b_nk=b_nk, c=c,
-                           a_scale=a_scale, b_scale=b_scale,
+                def run_fn(kernel_fn=kernel_fn, a_desc=a_desc, a_scale_desc=a_scale_desc,
+                           b_desc=b_desc, b_scale_desc=b_scale_desc, c_desc=c_desc,
                            M=M, N=N, K=K, grid=grid,
                            block_m=block_m, block_n=block_n, block_k=block_k,
-                           block_size_scale_k=block_size_scale_k,
+                           rep_m=rep_m, rep_n=rep_n, rep_k=rep_k,
                            num_warps=num_warps, num_stages=num_stages, vec_size=vec_size):
-
                     kernel_fn[grid](
-                        a, b_nk, c, a_scale, b_scale,
+                        a_desc, a_scale_desc, b_desc, b_scale_desc, c_desc,
                         M, N, K,
-                        a.stride(0), a.stride(1),       # A strides [M, K]
-                        b_nk.stride(0), b_nk.stride(1), # B strides [N, K]
-                        c.stride(0), c.stride(1),
-                        a_scale.stride(0), a_scale.stride(1),
-                        b_scale.stride(0), b_scale.stride(1),
                         BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=block_n, BLOCK_SIZE_K=block_k,
-                        BLOCK_SIZE_SCALE_K=block_size_scale_k,
                         VEC_SIZE=vec_size,
-
-                        num_warps=num_warps, num_stages=num_stages,
+                        REP_M=rep_m, REP_N=rep_n, REP_K=rep_k,
+                        NUM_STAGES=num_stages,
+                        num_warps=num_warps,
                     )
+
 
 
             else:
@@ -535,7 +555,9 @@ def main():
     print("=" * 100)
     print()
     print("Key: tl.dot_scaled uses hardware-native microscaling (K-group=32, E8M0 scale)")
+    print("     MXFP8 dot_scaled uses TensorDescriptor + NVIDIA packed 5D scale layout")
     print("     Manual scale uses software float32 broadcast multiply (K-group=128)")
+
     print()
 
 
@@ -555,8 +577,12 @@ def main():
         # Good configs from previous benchmark for 101KB shmem
         (64, 128, 128, 4, 3),
         (64, 128, 128, 4, 2),
+        (128, 128, 128, 4, 3),
         (128, 128, 128, 4, 2),
+        (128, 256, 128, 4, 3),
+        (128, 256, 128, 4, 2),
         (64, 256, 128, 4, 2),
+
         (64, 128, 64, 4, 3),
         (64, 256, 64, 4, 3),
         (64, 256, 64, 4, 2),
@@ -608,13 +634,14 @@ def main():
                 "SCALE_BLOCK_K": 128,
             }
 
-            # 4. MXFP8 dot_scaled (hardware native)
+            # 4. MXFP8 dot_scaled (hardware native, TensorDescriptor + packed 5D scale)
             configs[f"MXFP8 dot_scaled  {tag}"] = {
-                "kernel": matmul_mxfp8_dot_scaled_kernel,
+                "kernel": matmul_mxfp8_dot_scaled_tma_kernel,
                 "variant": "mxfp8_dot_scaled",
                 "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
                 "num_warps": nw, "num_stages": ns,
             }
+
 
             results = run_benchmark(M, N, K, configs, warmup=10, rep=50)
 
@@ -623,9 +650,12 @@ def main():
                     err = res["error"]
                     if "shared memory" in err:
                         print(f"  {rname:<58} [SHMEM OOM]")
+                    elif err.startswith("SKIP:"):
+                        print(f"  {rname:<58} [SKIP] {err[5:165]}")
                     else:
                         print(f"  {rname:<58} [ERR] {err[:160]}")
                         if "MXFP8 dot_scaled" in rname and not printed_dot_scaled_traceback and "traceback" in res:
+
                             print("    First dot_scaled traceback tail:")
                             for line in res["traceback"].rstrip().splitlines()[-12:]:
                                 print(f"    {line}")
@@ -663,9 +693,10 @@ def main():
                 "fp8_manual_scale": {"kernel": matmul_fp8_manual_scale_kernel, "variant": "fp8_manual_scale",
                                      "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
                                      "num_warps": nw, "num_stages": ns, "SCALE_BLOCK_K": 128},
-                "mxfp8_dot_scaled": {"kernel": matmul_mxfp8_dot_scaled_kernel, "variant": "mxfp8_dot_scaled",
+                "mxfp8_dot_scaled": {"kernel": matmul_mxfp8_dot_scaled_tma_kernel, "variant": "mxfp8_dot_scaled",
                                      "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
                                      "num_warps": nw, "num_stages": ns},
+
             }
 
             results = run_benchmark(M, N, K, configs, warmup=10, rep=50)
