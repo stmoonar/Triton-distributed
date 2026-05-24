@@ -15,10 +15,13 @@ Usage:
     python -m triton_dist.kernels.nvidia.benchmark_dot_scaled
 """
 
+import traceback
+
 import torch
 import triton
 import triton.language as tl
 import numpy as np
+
 
 
 # ============================================================
@@ -179,9 +182,9 @@ def matmul_fp8_manual_scale_kernel(
 # lhs_scale: [BLOCK_M, BLOCK_K // 32]
 # rhs_scale: [BLOCK_N, BLOCK_K // 32]  (NOTE: shape is [N, K//32], NOT transposed!)
 #
-# API: tl.dot_scaled(lhs=[M,K], lhs_scale=[M,K//32], "e4m3",
-#                    rhs=[K,N], rhs_scale=[N,K//32], "e4m3", acc)
-# rhs is [K, N] layout! rhs_scale is [N, K//32] layout (do NOT transpose)
+# Follow Triton's block-scaled tutorial pattern:
+#   physical B is stored as [N, K], load [BLOCK_N, BLOCK_K], then pass b.T as logical [K, N].
+# This keeps the RHS operand/scale association explicit for tl.dot_scaled lowering.
 # ============================================================
 @triton.jit
 def matmul_mxfp8_dot_scaled_kernel(
@@ -189,7 +192,7 @@ def matmul_mxfp8_dot_scaled_kernel(
     a_scale_ptr, b_scale_ptr,
     M, N, K,
     stride_am, stride_ak,
-    stride_bk, stride_bn,  # B is [K, N]
+    stride_bn, stride_bk,  # B is physically [N, K]
     stride_cm, stride_cn,
     stride_asm, stride_ask,  # a_scale strides: [M, K//32]
     stride_bsn, stride_bsk,  # b_scale strides: [N, K//32]
@@ -200,13 +203,13 @@ def matmul_mxfp8_dot_scaled_kernel(
 ):
     """
     MXFP8 GEMM using tl.dot_scaled for hardware-native microscaling.
-    
+
     Data layout:
       A: [M, K] in float8_e4m3fn (row-major)
-      B: [K, N] in float8_e4m3fn (standard GEMM layout)
+      B: [N, K] in float8_e4m3fn; kernel passes B tile transposed as logical rhs [K, N]
       a_scale: [M, K//32] in uint8 (E8M0)
       b_scale: [N, K//32] in uint8 (E8M0) - NOTE: [N, K//32] not [K//32, N]!
-    
+
     IMPORTANT constraints:
       - K must be divisible by BLOCK_SIZE_K (no mask on dot_scaled inputs)
       - BLOCK_SIZE_K must be divisible by 32 (VEC_SIZE)
@@ -220,8 +223,8 @@ def matmul_mxfp8_dot_scaled_kernel(
 
     # A is [M, K]: load tile [BLOCK_M, BLOCK_K]
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    # B is [K, N]: load tile [BLOCK_K, BLOCK_N]
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    # B is physically [N, K]: load tile [BLOCK_N, BLOCK_K], pass b.T to dot_scaled
+    b_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk
 
     # Scale pointers
     # a_scale: [M, K//32], load [BLOCK_M, BLOCK_K//32] per iteration
@@ -236,9 +239,8 @@ def matmul_mxfp8_dot_scaled_kernel(
 
     num_k_iters = K // BLOCK_SIZE_K  # K must be divisible by BLOCK_SIZE_K
     for k in range(0, num_k_iters):
-        # Load A tile [BLOCK_M, BLOCK_K] - no mask needed (K divisible by BLOCK_K)
+        # Load A tile [BLOCK_M, BLOCK_K] and physical B tile [BLOCK_N, BLOCK_K]
         a = tl.load(a_ptrs)
-        # Load B tile [BLOCK_K, BLOCK_N] - no mask needed
         b = tl.load(b_ptrs)
 
         # Load scale tiles
@@ -252,12 +254,11 @@ def matmul_mxfp8_dot_scaled_kernel(
             b_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_bsk
         )
 
-        # Use hardware-native dot_scaled
         # lhs: [BLOCK_M, BLOCK_K], lhs_scale: [BLOCK_M, BLOCK_K//32]
-        # rhs: [BLOCK_K, BLOCK_N], rhs_scale: [BLOCK_N, BLOCK_K//32]
+        # rhs: b.T -> [BLOCK_K, BLOCK_N], rhs_scale: [BLOCK_N, BLOCK_K//32]
         accumulator = tl.dot_scaled(
             a, a_scale, "e4m3",
-            b, b_scale, "e4m3",
+            b.T, b_scale, "e4m3",
             accumulator
         )
 
@@ -267,6 +268,7 @@ def matmul_mxfp8_dot_scaled_kernel(
     c = accumulator.to(tl.bfloat16)
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
 
 
 # ============================================================
@@ -287,8 +289,10 @@ def matmul_mxfp8_dot_scaled_tma_kernel(
 ):
     """
     MXFP8 GEMM using tl.dot_scaled with TMA descriptors for data tiles.
+    B descriptor is physical [N, K]; kernel passes b.T as logical rhs [K, N].
     Scale is still loaded via tl.load (simpler than 5D packed layout).
     """
+
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -307,9 +311,10 @@ def matmul_mxfp8_dot_scaled_tma_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # TMA loads: a=[BLOCK_M, BLOCK_K], b=[BLOCK_K, BLOCK_N]
+        # TMA loads: a=[BLOCK_M, BLOCK_K], physical b=[BLOCK_N, BLOCK_K]
         a = a_desc.load([offs_am, k * BLOCK_SIZE_K])
-        b = b_desc.load([k * BLOCK_SIZE_K, offs_bn])
+        b = b_desc.load([offs_bn, k * BLOCK_SIZE_K])
+
 
         # Load scales via tl.load
         scale_k_offset = k * num_scale_per_block
@@ -320,12 +325,13 @@ def matmul_mxfp8_dot_scaled_tma_kernel(
             b_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_bsk
         )
 
-        # rhs is [BLOCK_K, BLOCK_N], rhs_scale is [BLOCK_N, BLOCK_K//32]
+        # rhs is b.T -> [BLOCK_K, BLOCK_N], rhs_scale is [BLOCK_N, BLOCK_K//32]
         accumulator = tl.dot_scaled(
             a, a_scale, "e4m3",
-            b, b_scale, "e4m3",
+            b.T, b_scale, "e4m3",
             accumulator
         )
+
 
     c_desc.store([offs_am, offs_bn], accumulator.to(tl.bfloat16))
 
@@ -414,12 +420,11 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
             elif variant == "mxfp8_dot_scaled":
                 # MXFP8 with tl.dot_scaled
                 # A: [M, K] in float8_e4m3fn
-                # B: [K, N] in float8_e4m3fn (standard GEMM layout, rhs=[K,N])
+                # B: [N, K] in float8_e4m3fn, passed as b.T to dot_scaled logical rhs=[K,N]
                 # a_scale: [M, K//32] in uint8 (E8M0)
                 # b_scale: [N, K//32] in uint8 (E8M0) - shape is [N, K//32]!
                 a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-                # B stored as [K, N] - standard layout for dot_scaled rhs
-                b_kn = torch.randn(K, N, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+                b_nk = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
                 c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 
                 vec_size = 32
@@ -432,19 +437,19 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
 
                 # Skip if K is not divisible by block_k (dot_scaled doesn't support masks)
                 if K % block_k != 0:
-                    results[f"MXFP8 dot_scaled  {tag}"] = {"error": "K not divisible by BLOCK_K"}
+                    results[name] = {"error": "K not divisible by BLOCK_K"}
                     continue
 
-                def run_fn(kernel_fn=kernel_fn, a=a, b_kn=b_kn, c=c,
+                def run_fn(kernel_fn=kernel_fn, a=a, b_nk=b_nk, c=c,
                            a_scale=a_scale, b_scale=b_scale,
                            M=M, N=N, K=K, grid=grid,
                            block_m=block_m, block_n=block_n, block_k=block_k,
                            num_warps=num_warps, num_stages=num_stages, vec_size=vec_size):
                     kernel_fn[grid](
-                        a, b_kn, c, a_scale, b_scale,
+                        a, b_nk, c, a_scale, b_scale,
                         M, N, K,
                         a.stride(0), a.stride(1),       # A strides [M, K]
-                        b_kn.stride(0), b_kn.stride(1), # B strides [K, N]
+                        b_nk.stride(0), b_nk.stride(1), # B strides [N, K]
                         c.stride(0), c.stride(1),
                         a_scale.stride(0), a_scale.stride(1),
                         b_scale.stride(0), b_scale.stride(1),
@@ -452,6 +457,7 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                         VEC_SIZE=vec_size,
                         num_warps=num_warps, num_stages=num_stages,
                     )
+
 
             else:
                 print(f"  [SKIP] Unknown variant: {variant}")
@@ -488,25 +494,32 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                 "peak_tflops": peak_tflops,
             }
 
-        except Exception as e:
-            err = str(e)
-            if len(err) > 120:
-                err = err[:120] + "..."
-            results[name] = {"error": err}
+        except Exception:
+            tb = traceback.format_exc()
+            lines = [line.strip() for line in tb.splitlines() if line.strip()]
+            err = lines[-1] if lines else "unknown error"
+            results[name] = {"error": err, "traceback": tb}
+
 
     return results
 
 
 def main():
+    compute_capability = torch.cuda.get_device_capability()
+
     print("=" * 100)
     print("MXFP8 dot_scaled Benchmark (Blackwell SM120a)")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Compute Capability: {torch.cuda.get_device_capability()}")
+    print(f"Compute Capability: {compute_capability}")
+    print(f"Triton: {getattr(triton, '__version__', 'unknown')}")
+    if compute_capability[0] == 12:
+        print("Note: SM120/SM120a tl.dot_scaled support depends on your Triton/CUDA build.")
     print("=" * 100)
     print()
     print("Key: tl.dot_scaled uses hardware-native microscaling (K-group=32, E8M0 scale)")
     print("     Manual scale uses software float32 broadcast multiply (K-group=128)")
     print()
+
 
     # Problem sizes (MoE-relevant)
     problem_sizes = [
@@ -534,7 +547,10 @@ def main():
         (128, 256, 64, 4, 2),
     ]
 
+    printed_dot_scaled_traceback = False
+
     for M, N, K in problem_sizes:
+
         print(f"\n{'═' * 100}")
         print(f"Problem: M={M}, N={N}, K={K}  |  FLOPS={2.0*M*N*K/1e9:.2f} GFLOPS")
         print(f"{'═' * 100}")
@@ -590,10 +606,16 @@ def main():
                     if "shared memory" in err:
                         print(f"  {rname:<58} [SHMEM OOM]")
                     else:
-                        print(f"  {rname:<58} [ERR] {err[:60]}")
+                        print(f"  {rname:<58} [ERR] {err[:160]}")
+                        if "MXFP8 dot_scaled" in rname and not printed_dot_scaled_traceback and "traceback" in res:
+                            print("    First dot_scaled traceback tail:")
+                            for line in res["traceback"].rstrip().splitlines()[-12:]:
+                                print(f"    {line}")
+                            printed_dot_scaled_traceback = True
                 else:
                     print(f"  {rname:<58} {res['avg_ms']:<9.4f} {res['min_ms']:<9.4f} "
                           f"{res['avg_tflops']:<9.2f} {res['peak_tflops']:<9.2f}")
+
 
             print()  # spacer between tile configs
 
