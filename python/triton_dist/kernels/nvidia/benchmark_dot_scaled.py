@@ -199,8 +199,10 @@ def matmul_mxfp8_dot_scaled_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_SCALE_K: tl.constexpr,
     VEC_SIZE: tl.constexpr,  # = 32 for MXFP8
 ):
+
     """
     MXFP8 GEMM using tl.dot_scaled for hardware-native microscaling.
 
@@ -214,8 +216,11 @@ def matmul_mxfp8_dot_scaled_kernel(
       - K must be divisible by BLOCK_SIZE_K (no mask on dot_scaled inputs)
       - BLOCK_SIZE_K must be divisible by 32 (VEC_SIZE)
     """
+    tl.static_assert(BLOCK_SIZE_K == BLOCK_SIZE_SCALE_K * VEC_SIZE)
+
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -229,8 +234,9 @@ def matmul_mxfp8_dot_scaled_kernel(
     # Scale pointers
     # a_scale: [M, K//32], load [BLOCK_M, BLOCK_K//32] per iteration
     # b_scale: [N, K//32], load [BLOCK_N, BLOCK_K//32] per iteration
-    num_scale_per_block = BLOCK_SIZE_K // VEC_SIZE  # e.g., 128//32 = 4
-    offs_scale_k = tl.arange(0, num_scale_per_block)
+    num_scale_per_block: tl.constexpr = BLOCK_SIZE_SCALE_K  # e.g., 128//32 = 4
+    offs_scale_k = tl.arange(0, BLOCK_SIZE_SCALE_K)
+
 
     a_scale_base = a_scale_ptr + offs_m[:, None] * stride_asm
     b_scale_base = b_scale_ptr + offs_n[:, None] * stride_bsn
@@ -285,22 +291,27 @@ def matmul_mxfp8_dot_scaled_tma_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_SCALE_K: tl.constexpr,
     VEC_SIZE: tl.constexpr,
 ):
+
     """
     MXFP8 GEMM using tl.dot_scaled with TMA descriptors for data tiles.
     B descriptor is physical [N, K]; kernel passes b.T as logical rhs [K, N].
     Scale is still loaded via tl.load (simpler than 5D packed layout).
     """
+    tl.static_assert(BLOCK_SIZE_K == BLOCK_SIZE_SCALE_K * VEC_SIZE)
 
     pid_m = tl.program_id(0)
+
     pid_n = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    num_scale_per_block = BLOCK_SIZE_K // VEC_SIZE
-    offs_scale_k = tl.arange(0, num_scale_per_block)
+    num_scale_per_block: tl.constexpr = BLOCK_SIZE_SCALE_K
+    offs_scale_k = tl.arange(0, BLOCK_SIZE_SCALE_K)
+
 
     a_scale_base = a_scale_ptr + offs_m[:, None] * stride_asm
     b_scale_base = b_scale_ptr + offs_n[:, None] * stride_bsn
@@ -428,7 +439,9 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                 c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 
                 vec_size = 32
+                block_size_scale_k = block_k // vec_size
                 num_scale_k = K // vec_size  # K must be divisible by 32
+
                 # E8M0 scale = 127 means scale factor = 1.0
                 a_scale = torch.full((M, num_scale_k), 127, device="cuda", dtype=torch.uint8)
                 b_scale = torch.full((N, num_scale_k), 127, device="cuda", dtype=torch.uint8)
@@ -444,7 +457,9 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                            a_scale=a_scale, b_scale=b_scale,
                            M=M, N=N, K=K, grid=grid,
                            block_m=block_m, block_n=block_n, block_k=block_k,
+                           block_size_scale_k=block_size_scale_k,
                            num_warps=num_warps, num_stages=num_stages, vec_size=vec_size):
+
                     kernel_fn[grid](
                         a, b_nk, c, a_scale, b_scale,
                         M, N, K,
@@ -454,7 +469,9 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                         a_scale.stride(0), a_scale.stride(1),
                         b_scale.stride(0), b_scale.stride(1),
                         BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=block_n, BLOCK_SIZE_K=block_k,
+                        BLOCK_SIZE_SCALE_K=block_size_scale_k,
                         VEC_SIZE=vec_size,
+
                         num_warps=num_warps, num_stages=num_stages,
                     )
 
@@ -494,11 +511,12 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                 "peak_tflops": peak_tflops,
             }
 
-        except Exception:
+        except Exception as e:
             tb = traceback.format_exc()
-            lines = [line.strip() for line in tb.splitlines() if line.strip()]
-            err = lines[-1] if lines else "unknown error"
+            first_line = str(e).strip().splitlines()[0] if str(e).strip() else ""
+            err = f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__
             results[name] = {"error": err, "traceback": tb}
+
 
 
     return results
