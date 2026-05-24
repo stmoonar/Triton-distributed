@@ -615,13 +615,14 @@ def dot_k_const(
 
         dot = tl.dot(a, b)
         if USE_FP8:
-            k_scale_idx = (k * BLOCK_SIZE_K) // FP8_BLOCK_K
-
-            a_scale = tl.load(a_scale_ptrs + k_scale_idx * stride_ask,
-                              mask=tl.arange(0, BLOCK_SIZE_M) < M, other=1.0).to(tl.float32)
-            b_scale = tl.load(b_scale_ptrs + k_scale_idx * stride_bsk,
-                              mask=tl.arange(0, BLOCK_SIZE_N) < N, other=1.0).to(tl.float32)
-            dot = dot * a_scale[:, None] * b_scale[None, :]
+            pass
+            # k_scale_idx = (k * BLOCK_SIZE_K) // FP8_BLOCK_K
+            #
+            # a_scale = tl.load(a_scale_ptrs + k_scale_idx * stride_ask,
+            #                   mask=tl.arange(0, BLOCK_SIZE_M) < M, other=1.0).to(tl.float32)
+            # b_scale = tl.load(b_scale_ptrs + k_scale_idx * stride_bsk,
+            #                   mask=tl.arange(0, BLOCK_SIZE_N) < N, other=1.0).to(tl.float32)
+            # dot = dot * a_scale[:, None] * b_scale[None, :]
         accumulator += dot
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
