@@ -615,14 +615,13 @@ def dot_k_const(
 
         dot = tl.dot(a, b)
         if USE_FP8:
-            pass
-            # k_scale_idx = (k * BLOCK_SIZE_K) // FP8_BLOCK_K
-            #
-            # a_scale = tl.load(a_scale_ptrs + k_scale_idx * stride_ask,
-            #                   mask=tl.arange(0, BLOCK_SIZE_M) < M, other=1.0).to(tl.float32)
-            # b_scale = tl.load(b_scale_ptrs + k_scale_idx * stride_bsk,
-            #                   mask=tl.arange(0, BLOCK_SIZE_N) < N, other=1.0).to(tl.float32)
-            # dot = dot * a_scale[:, None] * b_scale[None, :]
+            tl.static_assert(FP8_BLOCK_N % BLOCK_SIZE_N == 0)
+            k_scale_idx = (k * BLOCK_SIZE_K) // FP8_BLOCK_K
+
+            a_scale = tl.load(a_scale_ptrs + k_scale_idx * stride_ask,
+                              mask=tl.arange(0, BLOCK_SIZE_M) < M, other=1.0).to(tl.float32)
+            b_scale = tl.load(b_scale_ptrs + k_scale_idx * stride_bsk).to(tl.float32)
+            dot = dot * (a_scale * b_scale)[:, None]
         accumulator += dot
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -743,8 +742,8 @@ def tile_kernel_moe_grouped_gemm_nk_const(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = (c_ptr + offs_token[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
     a_scale_ptrs = a_scale_ptr + offs_token * stride_asm
-    b_scale_ptrs = (b_scale_ptr + expert_id.to(tl.int64) * stride_bse +
-                    (offs_bn // FP8_BLOCK_N) * stride_bsn)
+    b_scale_n_group = (pid_n.to(tl.int64) * BLOCK_SIZE_N) // FP8_BLOCK_N
+    b_scale_ptrs = b_scale_ptr + expert_id.to(tl.int64) * stride_bse + b_scale_n_group * stride_bsn
 
 
     if ENABLE_PROFILING:
