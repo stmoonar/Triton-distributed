@@ -177,12 +177,11 @@ def matmul_fp8_manual_scale_kernel(
 # Kernel 4: MXFP8 with tl.dot_scaled (hardware-native microscaling)
 # K-group = 32, scale in E8M0 (uint8)
 # lhs_scale: [BLOCK_M, BLOCK_K // 32]
-# rhs_scale: [BLOCK_N, BLOCK_K // 32]
+# rhs_scale: [BLOCK_N, BLOCK_K // 32]  (NOTE: shape is [N, K//32], NOT transposed!)
 #
-# NOTE: rhs for dot_scaled should be (BLOCK_N, BLOCK_K) layout,
-# and the API uses b.T internally or we pass b as (N,K) and use .T
-# According to tutorial: tl.dot_scaled(a, scale_a, "e4m3", b.T, scale_b, "e4m3", acc)
-# where b is loaded as (BLOCK_N, BLOCK_K)
+# API: tl.dot_scaled(lhs=[M,K], lhs_scale=[M,K//32], "e4m3",
+#                    rhs=[K,N], rhs_scale=[N,K//32], "e4m3", acc)
+# rhs is [K, N] layout! rhs_scale is [N, K//32] layout (do NOT transpose)
 # ============================================================
 @triton.jit
 def matmul_mxfp8_dot_scaled_kernel(
@@ -190,7 +189,7 @@ def matmul_mxfp8_dot_scaled_kernel(
     a_scale_ptr, b_scale_ptr,
     M, N, K,
     stride_am, stride_ak,
-    stride_bk, stride_bn,
+    stride_bk, stride_bn,  # B is [K, N]
     stride_cm, stride_cn,
     stride_asm, stride_ask,  # a_scale strides: [M, K//32]
     stride_bsn, stride_bsk,  # b_scale strides: [N, K//32]
@@ -204,9 +203,13 @@ def matmul_mxfp8_dot_scaled_kernel(
     
     Data layout:
       A: [M, K] in float8_e4m3fn (row-major)
-      B: [N, K] in float8_e4m3fn (note: stored as N×K for dot_scaled RHS)
+      B: [K, N] in float8_e4m3fn (standard GEMM layout)
       a_scale: [M, K//32] in uint8 (E8M0)
-      b_scale: [N, K//32] in uint8 (E8M0)
+      b_scale: [N, K//32] in uint8 (E8M0) - NOTE: [N, K//32] not [K//32, N]!
+    
+    IMPORTANT constraints:
+      - K must be divisible by BLOCK_SIZE_K (no mask on dot_scaled inputs)
+      - BLOCK_SIZE_K must be divisible by 32 (VEC_SIZE)
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -217,8 +220,8 @@ def matmul_mxfp8_dot_scaled_kernel(
 
     # A is [M, K]: load tile [BLOCK_M, BLOCK_K]
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    # B is [N, K]: load tile [BLOCK_N, BLOCK_K] (will use .T in dot_scaled)
-    b_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk
+    # B is [K, N]: load tile [BLOCK_K, BLOCK_N]
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
     # Scale pointers
     # a_scale: [M, K//32], load [BLOCK_M, BLOCK_K//32] per iteration
@@ -231,34 +234,30 @@ def matmul_mxfp8_dot_scaled_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load A tile [BLOCK_M, BLOCK_K]
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k * BLOCK_SIZE_K < K, other=0.0)
-        # Load B tile [BLOCK_N, BLOCK_K]
-        b = tl.load(b_ptrs, mask=offs_k[None, :] + k * BLOCK_SIZE_K < K, other=0.0)
+    num_k_iters = K // BLOCK_SIZE_K  # K must be divisible by BLOCK_SIZE_K
+    for k in range(0, num_k_iters):
+        # Load A tile [BLOCK_M, BLOCK_K] - no mask needed (K divisible by BLOCK_K)
+        a = tl.load(a_ptrs)
+        # Load B tile [BLOCK_K, BLOCK_N] - no mask needed
+        b = tl.load(b_ptrs)
 
         # Load scale tiles
-        # a_scale: [BLOCK_M, num_scale_per_block]
+        # a_scale: [BLOCK_M, num_scale_per_block] (uint8, E8M0)
         scale_k_offset = k * num_scale_per_block
         a_scale = tl.load(
-            a_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_ask,
-            mask=offs_scale_k[None, :] + scale_k_offset < tl.cdiv(K, VEC_SIZE),
-            other=127  # E8M0: 127 means scale=1.0
+            a_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_ask
         )
-        # b_scale: [BLOCK_N, num_scale_per_block]
+        # b_scale: [BLOCK_N, num_scale_per_block] (uint8, E8M0)
         b_scale = tl.load(
-            b_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_bsk,
-            mask=offs_scale_k[None, :] + scale_k_offset < tl.cdiv(K, VEC_SIZE),
-            other=127
+            b_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_bsk
         )
 
         # Use hardware-native dot_scaled
-        # a: [BLOCK_M, BLOCK_K], a_scale: [BLOCK_M, BLOCK_K//32]
-        # b: [BLOCK_N, BLOCK_K], b_scale: [BLOCK_N, BLOCK_K//32]
-        # dot_scaled expects: lhs=[M,K], rhs=[K,N] (so we pass b.T)
+        # lhs: [BLOCK_M, BLOCK_K], lhs_scale: [BLOCK_M, BLOCK_K//32]
+        # rhs: [BLOCK_K, BLOCK_N], rhs_scale: [BLOCK_N, BLOCK_K//32]
         accumulator = tl.dot_scaled(
             a, a_scale, "e4m3",
-            b.T, b_scale, "e4m3",
+            b, b_scale, "e4m3",
             accumulator
         )
 
@@ -308,26 +307,23 @@ def matmul_mxfp8_dot_scaled_tma_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # TMA loads
+        # TMA loads: a=[BLOCK_M, BLOCK_K], b=[BLOCK_K, BLOCK_N]
         a = a_desc.load([offs_am, k * BLOCK_SIZE_K])
-        b = b_desc.load([offs_bn, k * BLOCK_SIZE_K])
+        b = b_desc.load([k * BLOCK_SIZE_K, offs_bn])
 
         # Load scales via tl.load
         scale_k_offset = k * num_scale_per_block
         a_scale = tl.load(
-            a_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_ask,
-            mask=offs_scale_k[None, :] + scale_k_offset < tl.cdiv(K, VEC_SIZE),
-            other=127
+            a_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_ask
         )
         b_scale = tl.load(
-            b_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_bsk,
-            mask=offs_scale_k[None, :] + scale_k_offset < tl.cdiv(K, VEC_SIZE),
-            other=127
+            b_scale_base + (offs_scale_k[None, :] + scale_k_offset) * stride_bsk
         )
 
+        # rhs is [BLOCK_K, BLOCK_N], rhs_scale is [BLOCK_N, BLOCK_K//32]
         accumulator = tl.dot_scaled(
             a, a_scale, "e4m3",
-            b.T, b_scale, "e4m3",
+            b, b_scale, "e4m3",
             accumulator
         )
 
@@ -418,32 +414,37 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
             elif variant == "mxfp8_dot_scaled":
                 # MXFP8 with tl.dot_scaled
                 # A: [M, K] in float8_e4m3fn
-                # B: [N, K] in float8_e4m3fn (note: N×K layout for dot_scaled RHS)
+                # B: [K, N] in float8_e4m3fn (standard GEMM layout, rhs=[K,N])
                 # a_scale: [M, K//32] in uint8 (E8M0)
-                # b_scale: [N, K//32] in uint8 (E8M0)
+                # b_scale: [N, K//32] in uint8 (E8M0) - shape is [N, K//32]!
                 a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-                # B stored as [N, K] for dot_scaled (RHS is transposed internally)
-                b_nk = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+                # B stored as [K, N] - standard layout for dot_scaled rhs
+                b_kn = torch.randn(K, N, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
                 c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 
                 vec_size = 32
-                num_scale_k = triton.cdiv(K, vec_size)
+                num_scale_k = K // vec_size  # K must be divisible by 32
                 # E8M0 scale = 127 means scale factor = 1.0
                 a_scale = torch.full((M, num_scale_k), 127, device="cuda", dtype=torch.uint8)
                 b_scale = torch.full((N, num_scale_k), 127, device="cuda", dtype=torch.uint8)
 
                 grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
 
-                def run_fn(kernel_fn=kernel_fn, a=a, b_nk=b_nk, c=c,
+                # Skip if K is not divisible by block_k (dot_scaled doesn't support masks)
+                if K % block_k != 0:
+                    results[f"MXFP8 dot_scaled  {tag}"] = {"error": "K not divisible by BLOCK_K"}
+                    continue
+
+                def run_fn(kernel_fn=kernel_fn, a=a, b_kn=b_kn, c=c,
                            a_scale=a_scale, b_scale=b_scale,
                            M=M, N=N, K=K, grid=grid,
                            block_m=block_m, block_n=block_n, block_k=block_k,
                            num_warps=num_warps, num_stages=num_stages, vec_size=vec_size):
                     kernel_fn[grid](
-                        a, b_nk, c, a_scale, b_scale,
+                        a, b_kn, c, a_scale, b_scale,
                         M, N, K,
                         a.stride(0), a.stride(1),       # A strides [M, K]
-                        b_nk.stride(0), b_nk.stride(1), # B strides [N, K]
+                        b_kn.stride(0), b_kn.stride(1), # B strides [K, N]
                         c.stride(0), c.stride(1),
                         a_scale.stride(0), a_scale.stride(1),
                         b_scale.stride(0), b_scale.stride(1),
