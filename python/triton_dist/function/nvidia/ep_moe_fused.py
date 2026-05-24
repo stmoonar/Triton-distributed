@@ -412,8 +412,8 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
         assert ep_group.size() <= 8
         optim_config = get_moe_optim_config(use_mega=True)
         profile_config = get_triton_dist_moe_profile_enabled()
-        fp8_dispatch_warps = min(optim_config.num_dispatch_warps, 8)
-        fp8_combine_warps = min(optim_config.num_combine_warps, 8)
+        fp8_dispatch_warps = min(optim_config.num_dispatch_warps, 4)
+        fp8_combine_warps = min(optim_config.num_combine_warps, 4)
 
         if fc1_2 is not None:
             fc1 = torch.cat([fc1_1, fc1_2], dim=1)
@@ -457,7 +457,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             gemm_output_data=None,
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FP8_FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=triton_dist_ep_ctx.ep_op.FP8_FWD_GEMM_BLOCK_SIZE_K,
-            gemm_GROUP_SIZE_M=1,
+            gemm_GROUP_SIZE_M=16,
             gemm_num_stages=triton_dist_ep_ctx.ep_op.FP8_FWD_GEMM_NUM_STAGES,
             use_block_wise_barrier=optim_config.dispatch_use_block_wise_barrier,
             num_warps=fp8_dispatch_warps,
@@ -486,7 +486,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             gemm_weight_reduce_last_dim=True,
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FP8_FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=triton_dist_ep_ctx.ep_op.FP8_FWD_GEMM_BLOCK_SIZE_K,
-            gemm_GROUP_SIZE_M=1,
+            gemm_GROUP_SIZE_M=16,
             gemm_num_stages=triton_dist_ep_ctx.ep_op.FP8_FWD_GEMM_NUM_STAGES,
             gate_input=None,
             cp_flag=False,
