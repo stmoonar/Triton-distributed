@@ -412,8 +412,8 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
         assert ep_group.size() <= 8
         optim_config = get_moe_optim_config(use_mega=True)
         profile_config = get_triton_dist_moe_profile_enabled()
-        fp8_dispatch_warps = min(optim_config.num_dispatch_warps, 4)
-        fp8_combine_warps = min(optim_config.num_combine_warps, 4)
+        fp8_dispatch_warps = min(optim_config.num_dispatch_warps, 8)
+        fp8_combine_warps = min(optim_config.num_combine_warps, 8)
 
         if fc1_2 is not None:
             fc1 = torch.cat([fc1_1, fc1_2], dim=1)
