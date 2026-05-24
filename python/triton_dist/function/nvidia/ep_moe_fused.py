@@ -34,6 +34,7 @@ from triton_dist.kernels.nvidia.group_gemm import (
 
 import torch.distributed as dist
 from triton_dist.kernels.nvidia.swiglu import swiglu_forward, swiglu_backward
+from triton_dist.kernels.nvidia.swiglu_quantize_fp8 import swiglu_quantize_fp8
 
 from .common import (custom_fwd, custom_bwd, init_triton_dist_ep_ctx, get_moe_optim_config,
                      get_triton_dist_moe_profile_enabled)
@@ -455,7 +456,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=128,
             gemm_GROUP_SIZE_M=1,
-            gemm_num_stages=5,
+            gemm_num_stages=3,
             use_block_wise_barrier=optim_config.dispatch_use_block_wise_barrier,
             num_warps=optim_config.num_dispatch_warps,
             enable_profiler=profile_config["fwd_dispatch"],
@@ -463,8 +464,9 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
         )
 
         triton_dist_ep_ctx.ep_a2a_layout_desc = dispatch_layout_desc
-        swiglu_output, _ = swiglu_forward(fc1_output, scale=dispatch_weight_in_buf.view(-1))
-        swiglu_output_fp8, swiglu_output_scale = _quantize_fp8_blockwise(swiglu_output, fp8_dtype)
+        swiglu_output_fp8, swiglu_output_scale = swiglu_quantize_fp8(
+            fc1_output, routing_weight=dispatch_weight_in_buf.view(-1), fp8_dtype=fp8_dtype, block_k=128
+        )
 
         combine_output = triton_dist_ep_ctx.ep_op.mega_group_gemm_combine(
             gemm_input_data=swiglu_output_fp8,
@@ -483,7 +485,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             gemm_BLOCK_SIZE_N=triton_dist_ep_ctx.ep_op.FWD_GEMM_BLOCK_SIZE_N,
             gemm_BLOCK_SIZE_K=128,
             gemm_GROUP_SIZE_M=1,
-            gemm_num_stages=5,
+            gemm_num_stages=3,
             gate_input=None,
             cp_flag=False,
             combine_output=None,
