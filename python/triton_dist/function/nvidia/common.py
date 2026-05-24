@@ -212,7 +212,7 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
                                              FP8_FWD_GEMM_BLOCK_SIZE_K=128,
                                              FP8_FWD_GEMM_NUM_STAGES=4,
                                              BF16_FWD_GEMM_BLOCK_SIZE_K=64,
-                                             BF16_FWD_GEMM_NUM_STAGES=4,
+                                             BF16_FWD_GEMM_NUM_STAGES=3,
                                              need_reversed_token_scatter_idx=True, lazy=True)
 
         # Print nvshmem memory requirement before allocation

@@ -74,7 +74,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
                  local_world_size: int, world_size: int, dtype=torch.bfloat16, weight_dtype=torch.float32, num_sm=20,
                  sm_margin=0, duplicate_comm_buffer: int = 1, capacity=4.0, FWD_GEMM_BLOCK_SIZE_N=256,
                  FP8_FWD_GEMM_BLOCK_SIZE_N=128, FP8_FWD_GEMM_BLOCK_SIZE_K=128, FP8_FWD_GEMM_NUM_STAGES=4,
-                 BF16_FWD_GEMM_BLOCK_SIZE_K=64, BF16_FWD_GEMM_NUM_STAGES=4,
+                 BF16_FWD_GEMM_BLOCK_SIZE_K=64, BF16_FWD_GEMM_NUM_STAGES=3,
                  need_reversed_token_scatter_idx=False, lazy: bool = False):
         super().__init__()
         self.offset_dtype = torch.int32
