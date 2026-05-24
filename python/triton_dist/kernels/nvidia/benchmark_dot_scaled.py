@@ -448,15 +448,18 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
                         "error": "SKIP: packed scale path requires BLOCK_M/BLOCK_N multiples of 128 and BLOCK_K multiple of 128"
                     }
                     continue
-                if M % block_m != 0 or N % block_n != 0 or K % block_k != 0:
-                    results[name] = {
-                        "error": "SKIP: TensorDescriptor path currently requires M/N/K divisible by block sizes"
-                    }
+                if K % block_k != 0:
+                    results[name] = {"error": "SKIP: TensorDescriptor path currently requires K divisible by BLOCK_K"}
                     continue
 
-                a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-                b_nk = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-                c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+                # Packed scale layout has 128-row granularity. For skinny M (e.g. M=64),
+                # benchmark a padded tensor and report effective TFLOPS using the original M/N.
+                m_kernel = triton.cdiv(M, block_m) * block_m
+                n_kernel = triton.cdiv(N, block_n) * block_n
+
+                a = torch.randn(m_kernel, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+                b_nk = torch.randn(n_kernel, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+                c = torch.empty(m_kernel, n_kernel, device="cuda", dtype=torch.bfloat16)
 
                 rep_m = block_m // 128
                 rep_n = block_n // 128
@@ -465,23 +468,25 @@ def run_benchmark(M, N, K, configs, warmup=15, rep=80):
 
                 # Packed scale layout from Triton's block-scaled matmul tutorial.
                 # E8M0 scale = 127 means scale factor = 1.0.
-                a_scale = torch.full((1, M // 128, scale_k_chunks, 2, 256), 127, device="cuda", dtype=torch.uint8)
-                b_scale = torch.full((1, N // 128, scale_k_chunks, 2, 256), 127, device="cuda", dtype=torch.uint8)
+                a_scale = torch.full((1, m_kernel // 128, scale_k_chunks, 2, 256), 127, device="cuda", dtype=torch.uint8)
+                b_scale = torch.full((1, n_kernel // 128, scale_k_chunks, 2, 256), 127, device="cuda", dtype=torch.uint8)
 
                 a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
                 b_desc = TensorDescriptor(b_nk, b_nk.shape, b_nk.stride(), [block_n, block_k])
                 c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+
                 scale_block_shape_a = [1, rep_m, rep_k, 2, 256]
                 scale_block_shape_b = [1, rep_n, rep_k, 2, 256]
                 a_scale_desc = TensorDescriptor(a_scale, a_scale.shape, a_scale.stride(), scale_block_shape_a)
                 b_scale_desc = TensorDescriptor(b_scale, b_scale.shape, b_scale.stride(), scale_block_shape_b)
 
-                grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), )
+                grid = (triton.cdiv(m_kernel, block_m) * triton.cdiv(n_kernel, block_n), )
 
                 def run_fn(kernel_fn=kernel_fn, a_desc=a_desc, a_scale_desc=a_scale_desc,
                            b_desc=b_desc, b_scale_desc=b_scale_desc, c_desc=c_desc,
-                           M=M, N=N, K=K, grid=grid,
+                           M=m_kernel, N=n_kernel, K=K, grid=grid,
                            block_m=block_m, block_n=block_n, block_k=block_k,
+
                            rep_m=rep_m, rep_n=rep_n, rep_k=rep_k,
                            num_warps=num_warps, num_stages=num_stages, vec_size=vec_size):
                     kernel_fn[grid](
@@ -602,48 +607,53 @@ def main():
         print(f"{'─' * 100}")
 
         for block_m, block_n, block_k, nw, ns in tile_configs:
-            if block_m > M or block_n > N:
+            if block_n > N:
                 continue
 
             tag = f"[{block_m}x{block_n}x{block_k}, w{nw}, s{ns}]"
 
             configs = {}
 
-            # 1. BF16 baseline
-            configs[f"BF16              {tag}"] = {
-                "kernel": matmul_bf16_kernel,
-                "variant": "bf16",
-                "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                "num_warps": nw, "num_stages": ns,
-            }
+            if block_m <= M:
+                # 1. BF16 baseline
+                configs[f"BF16              {tag}"] = {
+                    "kernel": matmul_bf16_kernel,
+                    "variant": "bf16",
+                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                    "num_warps": nw, "num_stages": ns,
+                }
 
-            # 2. FP8 no scale
-            configs[f"FP8 no-scale      {tag}"] = {
-                "kernel": matmul_fp8_noscale_kernel,
-                "variant": "fp8_noscale",
-                "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                "num_warps": nw, "num_stages": ns,
-            }
+                # 2. FP8 no scale
+                configs[f"FP8 no-scale      {tag}"] = {
+                    "kernel": matmul_fp8_noscale_kernel,
+                    "variant": "fp8_noscale",
+                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                    "num_warps": nw, "num_stages": ns,
+                }
 
-            # 3. FP8 manual scale (production path)
-            configs[f"FP8 manual-scale  {tag}"] = {
-                "kernel": matmul_fp8_manual_scale_kernel,
-                "variant": "fp8_manual_scale",
-                "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                "num_warps": nw, "num_stages": ns,
-                "SCALE_BLOCK_K": 128,
-            }
+                # 3. FP8 manual scale (production path)
+                configs[f"FP8 manual-scale  {tag}"] = {
+                    "kernel": matmul_fp8_manual_scale_kernel,
+                    "variant": "fp8_manual_scale",
+                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                    "num_warps": nw, "num_stages": ns,
+                    "SCALE_BLOCK_K": 128,
+                }
 
             # 4. MXFP8 dot_scaled (hardware native, TensorDescriptor + packed 5D scale)
-            configs[f"MXFP8 dot_scaled  {tag}"] = {
-                "kernel": matmul_mxfp8_dot_scaled_tma_kernel,
-                "variant": "mxfp8_dot_scaled",
-                "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                "num_warps": nw, "num_stages": ns,
-            }
+            if block_m % 128 == 0 and block_n % 128 == 0 and block_k % 128 == 0:
+                configs[f"MXFP8 dot_scaled  {tag}"] = {
+                    "kernel": matmul_mxfp8_dot_scaled_tma_kernel,
+                    "variant": "mxfp8_dot_scaled",
+                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                    "num_warps": nw, "num_stages": ns,
+                }
 
+            if not configs:
+                continue
 
             results = run_benchmark(M, N, K, configs, warmup=10, rep=50)
+
 
             for rname, res in results.items():
                 if "error" in res:
@@ -679,27 +689,37 @@ def main():
         best_cfg = {"bf16": "", "fp8_noscale": "", "fp8_manual_scale": "", "mxfp8_dot_scaled": ""}
 
         for block_m, block_n, block_k, nw, ns in tile_configs:
-            if block_m > M or block_n > N:
+            if block_n > N:
                 continue
 
             tag = f"[{block_m}x{block_n}x{block_k}, w{nw}, s{ns}]"
-            configs = {
-                "bf16": {"kernel": matmul_bf16_kernel, "variant": "bf16",
-                         "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                         "num_warps": nw, "num_stages": ns},
-                "fp8_noscale": {"kernel": matmul_fp8_noscale_kernel, "variant": "fp8_noscale",
-                                "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                                "num_warps": nw, "num_stages": ns},
-                "fp8_manual_scale": {"kernel": matmul_fp8_manual_scale_kernel, "variant": "fp8_manual_scale",
-                                     "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                                     "num_warps": nw, "num_stages": ns, "SCALE_BLOCK_K": 128},
-                "mxfp8_dot_scaled": {"kernel": matmul_mxfp8_dot_scaled_tma_kernel, "variant": "mxfp8_dot_scaled",
-                                     "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
-                                     "num_warps": nw, "num_stages": ns},
+            configs = {}
 
-            }
+            if block_m <= M:
+                configs.update({
+                    "bf16": {"kernel": matmul_bf16_kernel, "variant": "bf16",
+                             "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                             "num_warps": nw, "num_stages": ns},
+                    "fp8_noscale": {"kernel": matmul_fp8_noscale_kernel, "variant": "fp8_noscale",
+                                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                                    "num_warps": nw, "num_stages": ns},
+                    "fp8_manual_scale": {"kernel": matmul_fp8_manual_scale_kernel, "variant": "fp8_manual_scale",
+                                         "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                                         "num_warps": nw, "num_stages": ns, "SCALE_BLOCK_K": 128},
+                })
+
+            if block_m % 128 == 0 and block_n % 128 == 0 and block_k % 128 == 0:
+                configs["mxfp8_dot_scaled"] = {
+                    "kernel": matmul_mxfp8_dot_scaled_tma_kernel, "variant": "mxfp8_dot_scaled",
+                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k,
+                    "num_warps": nw, "num_stages": ns,
+                }
+
+            if not configs:
+                continue
 
             results = run_benchmark(M, N, K, configs, warmup=10, rep=50)
+
             for vname, res in results.items():
                 if "error" not in res and res["peak_tflops"] > best[vname]:
                     best[vname] = res["peak_tflops"]
