@@ -412,6 +412,8 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
         assert ep_group.size() <= 8
         optim_config = get_moe_optim_config(use_mega=True)
         profile_config = get_triton_dist_moe_profile_enabled()
+        fp8_dispatch_warps = min(optim_config.num_dispatch_warps, 8)
+        fp8_combine_warps = min(optim_config.num_combine_warps, 8)
 
         if fc1_2 is not None:
             fc1 = torch.cat([fc1_1, fc1_2], dim=1)
@@ -458,7 +460,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             gemm_GROUP_SIZE_M=1,
             gemm_num_stages=triton_dist_ep_ctx.ep_op.FP8_FWD_GEMM_NUM_STAGES,
             use_block_wise_barrier=optim_config.dispatch_use_block_wise_barrier,
-            num_warps=optim_config.num_dispatch_warps,
+            num_warps=fp8_dispatch_warps,
             enable_profiler=profile_config["fwd_dispatch"],
             profile_file_name="mega_fp8_fwd_dispatch_group_gemm",
         )
@@ -493,7 +495,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             optional_sm=optim_config.num_combine_sms,
             num_reduce_sms=optim_config.num_reduce_sms_in_combine,
             optional_signal_tensor=None,
-            num_warps=optim_config.num_combine_warps,
+            num_warps=fp8_combine_warps,
             combine_mode="fuse_scatter",
             enable_profiler=profile_config["fwd_combine"],
             profile_file_name="mega_fp8_fwd_group_gemm_combine",
