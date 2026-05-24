@@ -207,7 +207,12 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
         triton_dist_ep_op = EpAll2AllFusedOp(ep_group, max_tokens_per_rank, hidden_size, topk, ep_rank, num_experts,
                                              min(8, ep_size), ep_size, dtype=dtype, weight_dtype=weight_dtype,
                                              num_sm=num_sm, sm_margin=sm_margin, duplicate_comm_buffer=num_buffers,
-                                             capacity=capacity, FWD_GEMM_BLOCK_SIZE_N=128,
+                                             capacity=capacity, FWD_GEMM_BLOCK_SIZE_N=256,
+                                             FP8_FWD_GEMM_BLOCK_SIZE_N=128,
+                                             FP8_FWD_GEMM_BLOCK_SIZE_K=128,
+                                             FP8_FWD_GEMM_NUM_STAGES=4,
+                                             BF16_FWD_GEMM_BLOCK_SIZE_K=64,
+                                             BF16_FWD_GEMM_NUM_STAGES=4,
                                              need_reversed_token_scatter_idx=True, lazy=True)
 
         # Print nvshmem memory requirement before allocation
