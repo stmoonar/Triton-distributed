@@ -25,6 +25,7 @@
 import subprocess
 import functools
 import warnings
+import shutil
 import torch
 import re
 import os
@@ -400,15 +401,19 @@ def is_gpu_max_performance_mode(device_id: int):
 
 @functools.lru_cache()
 def _path_to_binary(binary: str):
-    binary += sysconfig.get_config_var("EXE")
+    binary += sysconfig.get_config_var("EXE") or ""
     paths = [
         os.environ.get(f"TRITON_{binary.upper()}_PATH", ""),
+        shutil.which(binary) or "",
         os.path.join(Path(os.path.dirname(__file__)).parent, "triton/backends/nvidia/bin", binary),
     ]
 
     cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
+    cuda_path = os.getenv("CUDA_PATH", "")
 
     paths += [f"{cuda_home}/bin/{binary}"]
+    if cuda_path:
+        paths += [f"{cuda_path}/bin/{binary}"]
 
     for path in paths:
         if os.path.exists(path) and os.path.isfile(path):
@@ -428,6 +433,11 @@ def get_nvlink():
 @functools.lru_cache()
 def get_nvcc():
     return _path_to_binary("nvcc")
+
+
+@functools.lru_cache()
+def get_ptxas():
+    return _path_to_binary("ptxas")
 
 
 class NVSHMEMHelper:
@@ -523,7 +533,7 @@ class NVSHMEMHelper:
 
     @staticmethod
     def get_jit_nvshmem_cubin(user_ptx: str, capability: int, metadata):
-        from triton.backends.nvidia.compiler import sm_arch_from_capability, get_ptxas
+        from triton.backends.nvidia.compiler import sm_arch_from_capability
         num_warps = metadata["num_warps"]
         jit_code = NVSHMEMHelper.generate_sub_cu(user_ptx)
         NVSHMEM_HOME = NVSHMEMHelper.get_nvshmem_build_from_src_home()
@@ -549,7 +559,7 @@ class NVSHMEMHelper:
             except subprocess.CalledProcessError as e:
                 raise RuntimeError(f"PTX generation failed: {e}")
             fptx.flush()
-            ptxas = get_ptxas().path
+            ptxas, _ = get_ptxas()
             # ptx => cubin
             ptxas_cmd = [ptxas, "-c", fptx.name, f"--gpu-name={arch}", f"-maxrregcount={maxnreg}", "-o", fbin.name]
             try:

@@ -410,7 +410,13 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
         token_splits_this_rank = ep_a2a_layout_desc.recv_buf_tokens_per_expert[ep_rank]
 
         assert ep_group.size() <= 8
-        optim_config = get_moe_optim_config(use_mega=True)
+        # F-group SM/warp tuning is independent from D-group BF16 path: when the
+        # underlying ep_op was constructed with enable_fp8_rs=True the combine
+        # path goes through FP8 RS, so resolve the FP8RS-specific env-var
+        # overrides (`TRITON_DIST_FP8RS_NUM_*`) ahead of the global
+        # `TRITON_DIST_NUM_*` ones.
+        fp8_rs_enabled = bool(getattr(triton_dist_ep_ctx.ep_op, "enable_fp8_rs", False))
+        optim_config = get_moe_optim_config(use_mega=True, is_fp8_rs=fp8_rs_enabled)
         profile_config = get_triton_dist_moe_profile_enabled()
         fp8_dispatch_warps = min(optim_config.num_dispatch_warps, 8)
         fp8_combine_warps = min(optim_config.num_combine_warps, 8)
@@ -470,6 +476,11 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             fc1_output, routing_weight=dispatch_weight_in_buf.view(-1), fp8_dtype=fp8_dtype, block_k=128
         )
 
+        # FP8 ReduceScatter: when enabled at EpAll2AllFusedOp construction time, the
+        # combine GEMM emits FP8 + scale, scatter copies FP8 + scale, and topk_reduce
+        # dequantizes back to BF16 — halving combine traffic over NVSHMEM.
+        # `fp8_rs_enabled` was already resolved above (used for SM tuning); reuse it.
+
         combine_output = triton_dist_ep_ctx.ep_op.mega_group_gemm_combine(
             gemm_input_data=swiglu_output_fp8,
             gemm_weight=fc2,
@@ -499,6 +510,7 @@ class TritonDistFusedFp8EpMoeFunction(torch.autograd.Function):
             combine_mode="fuse_scatter",
             enable_profiler=profile_config["fwd_combine"],
             profile_file_name="mega_fp8_fwd_group_gemm_combine",
+            fp8_rs=fp8_rs_enabled,
         )
         return combine_output
 

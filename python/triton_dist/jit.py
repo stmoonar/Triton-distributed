@@ -172,11 +172,11 @@ class TritonDistJITFunction(KernelInterface[T]):
 
 
 def nvidia_stages_inspection_hook(self, stages, options, language, capability):
-    from triton.backends.nvidia.compiler import sm_arch_from_capability, get_ptxas
-    from triton_dist.nv_utils import NVSHMEMHelper, get_nvlink
+    from triton.backends.nvidia.compiler import sm_arch_from_capability
+    from triton_dist.nv_utils import NVSHMEMHelper, get_nvlink, get_ptxas
 
     def make_cubin(self, src, metadata, opt, capability):
-        ptxas = get_ptxas().path
+        ptxas, _ = get_ptxas()
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
             tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
             fsrc.write(src)

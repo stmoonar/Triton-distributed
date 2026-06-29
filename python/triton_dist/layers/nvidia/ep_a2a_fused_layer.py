@@ -75,7 +75,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
                  sm_margin=0, duplicate_comm_buffer: int = 1, capacity=4.0, FWD_GEMM_BLOCK_SIZE_N=256,
                  FP8_FWD_GEMM_BLOCK_SIZE_N=128, FP8_FWD_GEMM_BLOCK_SIZE_K=128, FP8_FWD_GEMM_NUM_STAGES=4,
                  BF16_FWD_GEMM_BLOCK_SIZE_K=64, BF16_FWD_GEMM_NUM_STAGES=3,
-                 need_reversed_token_scatter_idx=False, lazy: bool = False):
+                 need_reversed_token_scatter_idx=False, lazy: bool = False,
+                 enable_fp8_rs: bool = False, fp8_rs_dtype: torch.dtype = torch.float8_e4m3fn):
         super().__init__()
         self.offset_dtype = torch.int32
         self.ep_group = ep_group
@@ -245,6 +246,32 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 self.offset_dtype, fill_value=-1)
         else:
             self.mega_reversed_token_scatter_idx_buf = None
+        # ---- FP8 ReduceScatter buffers ----
+        # When enable_fp8_rs is True, the combine GEMM emits FP8 + scale and the scatter
+        # transports FP8 + scale to the destination rank, where topk_reduce dequantizes
+        # to BF16. We allocate FP8 mirrors of combine_in_buf and mega_combine_scatter_output_buf
+        # plus one fp32 scale tensor per data tensor (scale per FP8_OUT_BLOCK_N=128 columns).
+        self.enable_fp8_rs = enable_fp8_rs
+        self.fp8_rs_dtype = fp8_rs_dtype
+        self.FP8_OUT_BLOCK_N = self.FP8_BLOCK_SIZE_N  # row-wise 128-col block
+        self.num_combine_scale_groups = triton.cdiv(hidden, self.FP8_OUT_BLOCK_N)
+        if self.enable_fp8_rs:
+            self.combine_in_buf_fp8 = self._nvshmem_allocator.create_tensor(
+                "combine_in_buf_fp8", [math.ceil(avg_tokens * self.capacity), hidden], self.fp8_rs_dtype)
+            self.combine_in_scale_buf = self._nvshmem_allocator.create_tensor(
+                "combine_in_scale_buf",
+                [math.ceil(avg_tokens * self.capacity), self.num_combine_scale_groups], torch.float32)
+            self.mega_combine_scatter_output_buf_fp8 = self._nvshmem_allocator.create_tensor(
+                "mega_combine_scatter_output_buf_fp8",
+                [self.max_tokens * self.topk, self.hidden], self.fp8_rs_dtype)
+            self.mega_combine_scatter_output_scale_buf = self._nvshmem_allocator.create_tensor(
+                "mega_combine_scatter_output_scale_buf",
+                [self.max_tokens * self.topk, self.num_combine_scale_groups], torch.float32)
+        else:
+            self.combine_in_buf_fp8 = None
+            self.combine_in_scale_buf = None
+            self.mega_combine_scatter_output_buf_fp8 = None
+            self.mega_combine_scatter_output_scale_buf = None
         self.MAX_SMS = max(torch.cuda.get_device_properties(0).multi_processor_count - self.sm_margin, 1)
         self._task_counter_buf = torch.zeros([self.MAX_SMS], dtype=torch.int32, device="cuda")
         self.barrier_all_workspace = self._nvshmem_allocator.create_tensor("barrier_all_workspace",
@@ -337,6 +364,11 @@ class EpAll2AllFusedOp(torch.nn.Module):
         nvshmem_free_lazy_tensor(self.intra_node_dispatch_skipped_token_mapping_indices)
         if self.need_reversed_token_scatter_idx:
             nvshmem_free_lazy_tensor(self.mega_reversed_token_scatter_idx_buf)
+        if self.enable_fp8_rs:
+            nvshmem_free_lazy_tensor(self.combine_in_buf_fp8)
+            nvshmem_free_lazy_tensor(self.combine_in_scale_buf)
+            nvshmem_free_lazy_tensor(self.mega_combine_scatter_output_buf_fp8)
+            nvshmem_free_lazy_tensor(self.mega_combine_scatter_output_scale_buf)
         nvshmem_free_lazy_tensor(self.barrier_all_workspace)
 
     def init_output_buffer(self, num_recv_tokens_per_rank, min_m: Optional[int] = None):
@@ -879,8 +911,20 @@ class EpAll2AllFusedOp(torch.nn.Module):
         grad_GROUP_SIZE_M=3,
         enable_profiler: bool = False,
         profile_file_name: str = "mega_group_gemm_combine",
+        # ---- FP8 ReduceScatter ----
+        # When fp8_rs is True (and self.enable_fp8_rs was set at construction time),
+        # the combine GEMM emits FP8 + scale into self.combine_in_buf_fp8 /
+        # self.combine_in_scale_buf, the scatter copies FP8 + scale to
+        # self.mega_combine_scatter_output_buf_fp8 + scale_buf, and topk_reduce
+        # dequantizes to BF16 in self.combine_out_buf.
+        fp8_rs: bool = False,
     ):
         assert self.nnodes == 1, "Mega dispatch only support single node for now"
+        if fp8_rs:
+            assert self.enable_fp8_rs, "fp8_rs requires enable_fp8_rs=True at EpAll2AllFusedOp construction"
+            assert combine_mode == "fuse_scatter", "fp8_rs only supports fuse_scatter combine_mode"
+            assert gemm_BLOCK_SIZE_N == self.FP8_OUT_BLOCK_N, (
+                f"fp8_rs requires gemm_BLOCK_SIZE_N={gemm_BLOCK_SIZE_N} == FP8_OUT_BLOCK_N={self.FP8_OUT_BLOCK_N}")
         gemm_problem_shape, gemm_input_strides, gemm_weight_strides, gemm_M_grid = self.mega_preprocess_group_gemm(
             gemm_input_data,
             gemm_weight,
@@ -910,7 +954,17 @@ class EpAll2AllFusedOp(torch.nn.Module):
             gemm_weight_scale = gemm_weight
 
         # gemm output data is in combine buf
-        gemm_output_data = self.combine_in_buf[:gemm_M, :].view(gemm_M, gemm_N)
+        if fp8_rs:
+            # FP8 RS: GEMM emits FP8 + scale into the FP8 mirror buffers.
+            gemm_output_data = self.combine_in_buf_fp8[:gemm_M, :].view(gemm_M, gemm_N)
+            combine_in_scale = self.combine_in_scale_buf
+            scatter_output_buf = self.mega_combine_scatter_output_buf_fp8
+            scatter_output_scale_buf = self.mega_combine_scatter_output_scale_buf
+        else:
+            gemm_output_data = self.combine_in_buf[:gemm_M, :].view(gemm_M, gemm_N)
+            combine_in_scale = None
+            scatter_output_buf = self.mega_combine_scatter_output_buf
+            scatter_output_scale_buf = None
 
         # different combine mode has different profile tasks
         assert combine_mode in ["serial", "fuse_scatter"]
@@ -927,7 +981,10 @@ class EpAll2AllFusedOp(torch.nn.Module):
         if combine_mode == "fuse_scatter":
             # need to clear this buffer due to drop token
             # fill_tensor(self.mega_combine_scatter_output_buf[:M * self.topk], 0, MEGA_SMS)
-            self.mega_combine_scatter_output_buf[:M * self.topk].zero_()
+            scatter_output_buf[:M * self.topk].zero_()
+            if fp8_rs:
+                # zero the scale buffer too so that dropped tokens contribute 0 in the dequantize sum.
+                scatter_output_scale_buf[:M * self.topk].zero_()
         has_gate = gate_input is not None
         if has_gate:
             fill_tensor(
@@ -1030,8 +1087,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 # combine token params
                 ep_a2a_layout_desc.num_input_tokens_per_rank,  # [world_size]
                 ep_a2a_layout_desc.num_recv_tokens_per_rank,  # [world_size]
-                self.combine_in_buf,  # symm buffer (recv token in dispatch stage)
-                self.mega_combine_scatter_output_buf,  # symm buffer [max_tokens, topk, hidden]
+                self.combine_in_buf_fp8 if fp8_rs else self.combine_in_buf,  # symm buffer (recv token in dispatch stage)
+                scatter_output_buf,  # symm buffer [max_tokens, topk, hidden]
                 self.mega_combine_scatter_output_barrier_buf if num_reduce_sms > 0 else None,  # [max_tokens, topk, ]
                 self.combine_out_buf,  #[max_tokens, hidden]
                 self.combine_gate_in_buf,  # symm buffer [dynamic_num_of_tokens]
@@ -1059,6 +1116,15 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 profiler_buffer,
                 USE_FP8=use_fp8_scale,
                 ENABLE_PROFILING=enable_profiler,
+                # FP8 RS extension
+                OUT_FP8=fp8_rs,
+                c_scale_ptr=combine_in_scale,
+                stride_csm=(combine_in_scale.stride(0) if fp8_rs else 0),
+                stride_csn=(combine_in_scale.stride(1) if fp8_rs else 0),
+                input_scale_buf=combine_in_scale,
+                scatter_output_scale_buf=scatter_output_scale_buf,
+                FP8_OUT_BLOCK_N=self.FP8_OUT_BLOCK_N,
+                FP8_OUT_MAX=(torch.finfo(self.fp8_rs_dtype).max if fp8_rs else 448.0),
 
                 # num_warps=(num_scatter_warps + num_reduce_warps),
                 num_warps=num_warps,
@@ -1148,6 +1214,75 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         torch.cuda.current_stream().synchronize()
         self.ep_barrier_all()
+
+        if fp8_rs and os.environ.get("TRITON_DIST_FP8_RS_DEBUG") == "1":
+            # Diagnostic: re-run topk-reduce in PyTorch from the post-scatter FP8+scale buffers
+            # and compare against the kernel's combine_out_buf. Tells us whether the bug is in
+            # scatter (data/scale movement) vs topk_reduce (dequant) vs upstream (GEMM output).
+            with torch.no_grad():
+                fp8_rs_dtype = self.fp8_rs_dtype
+                topk = self.topk
+                hidden = self.hidden
+                num_blk = self.num_combine_scale_groups
+                # Get post-kernel buffers (already on device).
+                buf_fp8 = self.mega_combine_scatter_output_buf_fp8[:M * topk].view(M, topk, hidden)
+                buf_scale = self.mega_combine_scatter_output_scale_buf[:M * topk].view(M, topk, num_blk)
+                # Dequantize: data * scale (per-128-col block).
+                deq = buf_fp8.to(torch.float32).view(M, topk, num_blk, -1) * buf_scale.unsqueeze(-1)
+                ref_out = deq.sum(dim=1).reshape(M, hidden).to(torch.bfloat16)
+                kern_out = self.combine_out_buf.view(self.max_tokens, hidden)[:M].to(torch.bfloat16)
+                abs_diff = (ref_out.float() - kern_out.float()).abs()
+                cos = torch.nn.functional.cosine_similarity(
+                    ref_out.float().flatten().unsqueeze(0),
+                    kern_out.float().flatten().unsqueeze(0)).item()
+                if self.rank == 0:
+                    print(f"[FP8RS-DEBUG rank={self.rank}] kernel-vs-pytorch-topk-reduce: "
+                          f"max_abs={abs_diff.max().item():.6f} mean_abs={abs_diff.mean().item():.6f} "
+                          f"cos_sim={cos:.6f}", flush=True)
+                    print(f"[FP8RS-DEBUG rank={self.rank}] norms: |ref_out|={ref_out.float().norm().item():.4f} "
+                          f"|kern_out|={kern_out.float().norm().item():.4f} "
+                          f"|abs_diff|={abs_diff.norm().item():.4f}", flush=True)
+                    print(f"[FP8RS-DEBUG rank={self.rank}] sample row 0 ref_out[:8]={ref_out[0, :8].float().tolist()}",
+                          flush=True)
+                    print(f"[FP8RS-DEBUG rank={self.rank}] sample row 0 kern_out[:8]={kern_out[0, :8].float().tolist()}",
+                          flush=True)
+                    # Pattern check: which positions in kern_out are non-zero?
+                    ko_row0 = kern_out[0].float()
+                    nz_idx = (ko_row0.abs() > 0).nonzero(as_tuple=True)[0]
+                    print(f"[FP8RS-DEBUG rank={self.rank}] kern_out row 0 nonzero positions (first 32 of {len(nz_idx)}): "
+                          f"{nz_idx[:32].tolist()}", flush=True)
+                    print(f"[FP8RS-DEBUG rank={self.rank}] kern_out row 0 [0:32]={ko_row0[:32].tolist()}", flush=True)
+                    # Per-row aggregate
+                    per_row_nz = (kern_out.float().abs() > 0).sum(dim=-1)
+                    print(f"[FP8RS-DEBUG rank={self.rank}] kern_out per-row nonzero: "
+                          f"min={per_row_nz.min().item()} max={per_row_nz.max().item()} "
+                          f"mean={per_row_nz.float().mean().item():.2f}", flush=True)
+                    # Check buf stats
+                    print(f"[FP8RS-DEBUG rank={self.rank}] buf_fp8 stats: "
+                          f"|.float()|.max={buf_fp8.float().abs().max().item():.4f} "
+                          f"nonzero={(buf_fp8.float().abs() > 0).sum().item()}/{buf_fp8.numel()}", flush=True)
+                    print(f"[FP8RS-DEBUG rank={self.rank}] buf_scale stats: "
+                          f"max={buf_scale.max().item():.6f} min={buf_scale.min().item():.6f} "
+                          f"mean={buf_scale.mean().item():.6f} "
+                          f"nonzero={(buf_scale > 0).sum().item()}/{buf_scale.numel()}", flush=True)
+                    # Source-side combine_in_scale_buf (written by GEMM dot_k_const). If this is
+                    # sparse, the bug is in GEMM tile scale write. If this is dense but
+                    # buf_scale (post-scatter) is sparse, the bug is in scatter scale propagation.
+                    try:
+                        torch.cuda.synchronize()
+                        src_scale_full = self.combine_in_scale_buf
+                        # Just look at the first M tokens (the actual populated region for this batch).
+                        src_scale = src_scale_full[:M]
+                        print(f"[FP8RS-DEBUG rank={self.rank}] src_scale[:M] stats: "
+                              f"shape={tuple(src_scale.shape)} dtype={src_scale.dtype} "
+                              f"max={src_scale.max().item():.6f} mean={src_scale.mean().item():.6f} "
+                              f"nonzero={(src_scale > 0).sum().item()}/{src_scale.numel()}", flush=True)
+                        src_per_tok = (src_scale > 0).sum(dim=-1).float()
+                        print(f"[FP8RS-DEBUG rank={self.rank}] src_scale per-row nonzero: "
+                              f"min={src_per_tok.min().item()} max={src_per_tok.max().item()} "
+                              f"mean={src_per_tok.mean().item():.2f}", flush=True)
+                    except Exception as e:
+                        print(f"[FP8RS-DEBUG rank={self.rank}] src_scale dump failed: {e}", flush=True)
 
         reduce_buf = self.combine_out_buf
         reduce_gate_buf = self.combine_gate_out_buf

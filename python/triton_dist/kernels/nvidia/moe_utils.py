@@ -356,7 +356,7 @@ def calc_gather_scatter_index_v2_triton(
     calc_gather_scatter_index_v2_kernel[(nexperts, )](chosen_experts, ntokens_by_expert, gather_index, scatter_index,
                                                       expert_index, M_pad, workspace, ntokens, topk, nexperts,
                                                       BLOCK_SIZE=1024, ALIGNMENT_BY_EXPERT=alignment_by_expert,
-                                                      use_cooperative=True, num_warps=32,
+                                                      use_cooperative=True, num_warps=16,
                                                       **launch_cooperative_grid_options())
     return ntokens_by_expert, scatter_index, gather_index, expert_index, M_pad
 

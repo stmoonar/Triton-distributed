@@ -34,7 +34,7 @@ from .common_ops import barrier_on_this_grid, barrier_all_intra_node_atomic_cas_
 from triton_dist.tools.profiler import Profiler
 from triton.language import core
 from .memory_ops import (load_v4, store_v4, zero_vec_f32, unpack_bf16x2_f32, pack_f32_bf16x2, copy_warp,
-                         copy_1d_tilewise_kernel)
+                         copy_1d_tilewise_kernel, unpack_e4m3_b32x4_f32)
 
 
 @core.extern
@@ -581,6 +581,235 @@ def tile_kernel_topk_reduce_token_intra_node(
     return profiler
 
 
+# ==============================================================================
+# FP8 ReduceScatter (FP8 RS) kernels.
+#
+# These mirror the BF16 scatter/topk-reduce kernels above, but operate on FP8
+# data with row-wise per-block scales. They are used when the combine GEMM
+# output is fused-quantized to FP8 + scale (see dot_k_const OUT_FP8 branch).
+# ==============================================================================
+
+
+@triton_dist.jit(do_not_specialize=["pid", "num_pid"])
+def tile_kernel_scatter_token_intra_node_fp8(
+    pid,
+    num_pid,
+    barriers_ptr,  # symm buffer, per token barrier [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
+    num_recv_tokens_per_rank,
+    input_buf,  # symm buffer, FP8 [max_tokens, hidden]
+    input_scale_buf,  # local buffer, fp32 [max_tokens, hidden // FP8_OUT_BLOCK_N]
+    scatter_send_buf,  # symm buffer FP8 [max_tokens * topk, hidden]
+    scatter_send_scale_buf,  # symm buffer fp32 [max_tokens * topk, hidden // FP8_OUT_BLOCK_N]
+    output_buf,  # local buffer (only used to infer BF16 dtype) [max_tokens, hidden]
+    gate_input_buf,
+    gate_output_buf,
+    reversed_token_indices_buf,
+    scatter_output_barrier_buf,
+    hidden_size: tl.constexpr,
+    BARRIER_TOKEN_BLOCK_SIZE: tl.constexpr,  # GEMM block_size_n; equal to FP8 quant block
+    HAS_GATE: tl.constexpr,
+    num_warps: tl.constexpr,
+    profiler: Profiler,
+    ENABLE_PROFILING: tl.constexpr,
+):
+    tl.static_assert(
+        hidden_size % BARRIER_TOKEN_BLOCK_SIZE == 0,
+        "hidden_size must be divisible by BARRIER_TOKEN_BLOCK_SIZE")
+    N_BARRIERS_PER_TOKEN: tl.constexpr = hidden_size // BARRIER_TOKEN_BLOCK_SIZE
+    WARP_SIZE = 32
+
+    rank = dl.rank()
+    thread_idx = tid(0)
+    lane_idx = thread_idx % WARP_SIZE
+    total_warps = num_warps * num_pid
+    warp_id = thread_idx // WARP_SIZE
+    global_warp_id = pid * num_warps + warp_id
+
+    tl.static_assert(input_buf.dtype.element_ty == tl.float8e4nv or
+                     input_buf.dtype.element_ty == tl.float8e5,
+                     "input_buf must be FP8 (e4m3fn/e5m2)")
+    tl.static_assert(scatter_send_buf.dtype.element_ty == input_buf.dtype.element_ty,
+                     "scatter_send_buf must match input_buf dtype")
+    tl.static_assert(input_scale_buf.dtype.element_ty == tl.float32, "input_scale_buf must be fp32")
+    tl.static_assert(scatter_send_scale_buf.dtype.element_ty == tl.float32,
+                     "scatter_send_scale_buf must be fp32")
+    tl.static_assert(gate_input_buf.dtype.element_ty == tl.float32, "gate_input_buf must be float32")
+
+    # FP8: 8 bits per element, so a 16-byte vec carries 16 elements.
+    VEC_SIZE: tl.constexpr = 16
+    tl.static_assert(BARRIER_TOKEN_BLOCK_SIZE % VEC_SIZE == 0,
+                     "BARRIER_TOKEN_BLOCK_SIZE must be divisible by VEC_SIZE(=16) for FP8")
+    tl.static_assert(hidden_size % VEC_SIZE == 0, "hidden_size must be divisible by VEC_SIZE(=16)")
+
+    num_combine_token_cur_rank = tl.load(num_recv_tokens_per_rank + rank)
+
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=True, task_type=0)
+
+    tl.static_assert(reversed_token_indices_buf is not None)
+
+    for token_idx in range(global_warp_id, num_combine_token_cur_rank, total_warps):
+        input_token_idx = ld_b32(reversed_token_indices_buf + token_idx * 2)
+        from_rank = ld_b32(reversed_token_indices_buf + token_idx * 2 + 1)
+        for elem_idx in range(lane_idx, hidden_size // VEC_SIZE, WARP_SIZE):
+            barrier_n_idx = elem_idx * VEC_SIZE // BARRIER_TOKEN_BLOCK_SIZE
+            barrier_idx = token_idx * N_BARRIERS_PER_TOKEN + barrier_n_idx
+
+            if HAS_GATE and elem_idx == 0:
+                remote_gate_output_ptr = dl.symm_at(gate_output_buf, from_rank)
+                gate_val = ld_b32(gate_input_buf + token_idx)
+                st(
+                    remote_gate_output_ptr.to(tl.pointer_type(tl.uint32)) + input_token_idx,
+                    tl.cast(gate_val, dtype=tl.uint32, bitcast=True))
+            while ld_acquire(barriers_ptr + barrier_idx, scope="gpu") != 1:
+                pass
+
+            remote_output_ptr = dl.symm_at(scatter_send_buf, from_rank)
+            t1, t2, t3, t4 = load_v4(input_buf + token_idx * hidden_size + elem_idx * VEC_SIZE, "b32")
+            store_v4(remote_output_ptr + input_token_idx * hidden_size + elem_idx * VEC_SIZE, t1, t2, t3, t4, "b32")
+
+            # Each barrier_n_idx covers BARRIER_TOKEN_BLOCK_SIZE / VEC_SIZE elem indices.
+            # The lane whose elem_idx aligns to the start of the barrier block writes the scale once.
+            # NOTE: must use st() (PTX st.global.b32 inline asm) instead of tl.store for the
+            # divergent-if scalar store. Triton's tl.store of a per-lane scalar pointer/value
+            # inside a divergent if can be lowered into a single coalesced store that drops
+            # all lanes' writes except one, leading to ~31/32 of scales never landing on the
+            # destination buffer (observed empirically). st() goes through inline_asm_elementwise
+            # which does per-lane PTX stores and behaves correctly under divergence.
+            if (elem_idx * VEC_SIZE) % BARRIER_TOKEN_BLOCK_SIZE == 0:
+                remote_scale_ptr = dl.symm_at(scatter_send_scale_buf, from_rank)
+                scale_val = tl.load(input_scale_buf + token_idx * N_BARRIERS_PER_TOKEN + barrier_n_idx)
+                st(remote_scale_ptr + input_token_idx * N_BARRIERS_PER_TOKEN + barrier_n_idx,
+                   scale_val, scope="gpu", semantic="relaxed")
+
+        remote_scatter_output_barrier_buf = dl.symm_at(scatter_output_barrier_buf, from_rank)
+        if scatter_output_barrier_buf is not None:
+            sync_warp()
+            if lane_idx == 0:
+                libshmem_device.fence()
+                st(remote_scatter_output_barrier_buf + input_token_idx, 1, scope="sys", semantic="release")
+
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=False, task_type=0)
+    return profiler
+
+
+@triton_dist.jit(do_not_specialize=["pid", "num_pid"])
+def tile_kernel_topk_reduce_token_intra_node_fp8(
+    pid,
+    num_pid,
+    num_input_tokens_per_rank,  # [world_size]
+    scatter_send_buf,  # FP8 [max_tokens * topk, hidden]
+    scatter_send_scale_buf,  # fp32 [max_tokens * topk, hidden // FP8_OUT_BLOCK_N]
+    scatter_send_barrier_buf,  # [max_tokens * topk]
+    output_buf,  # BF16 [max_tokens, hidden]
+    gate_input_buf,
+    topk_indices_buf,
+    BLOCK_SIZE: tl.constexpr,  # FP8 quant block size on hidden (also == GEMM block_size_n)
+    topk: tl.constexpr,
+    num_experts,
+    hidden_size: tl.constexpr,
+    num_warps: tl.constexpr,
+    profiler: Profiler,
+    ENABLE_PROFILING: tl.constexpr,
+):
+    WARP_SIZE = 32
+
+    rank = dl.rank()
+    thread_idx = tid(0)
+    lane_idx = thread_idx % WARP_SIZE
+    total_warps = num_warps * num_pid
+    warp_id = thread_idx // WARP_SIZE
+    global_warp_id = pid * num_warps + warp_id
+
+    tl.static_assert(output_buf.dtype.element_ty == tl.bfloat16, "output_buf must be bfloat16")
+    tl.static_assert(scatter_send_buf.dtype.element_ty == tl.float8e4nv or
+                     scatter_send_buf.dtype.element_ty == tl.float8e5,
+                     "scatter_send_buf must be FP8")
+    tl.static_assert(scatter_send_scale_buf.dtype.element_ty == tl.float32,
+                     "scatter_send_scale_buf must be fp32")
+    tl.static_assert(gate_input_buf.dtype.element_ty == tl.float32, "gate_input_buf must be float32")
+
+    # FP8 vec size: 16 elements per 16 bytes (load_v4 b32).
+    FP8_VEC_SIZE: tl.constexpr = 16
+    tl.static_assert(BLOCK_SIZE % FP8_VEC_SIZE == 0, "BLOCK_SIZE must be divisible by FP8 VEC_SIZE")
+    tl.static_assert(hidden_size % FP8_VEC_SIZE == 0,
+                     "hidden_size must be divisible by FP8 VEC_SIZE")
+    tl.static_assert(hidden_size % BLOCK_SIZE == 0, "hidden_size must be divisible by BLOCK_SIZE")
+
+    N_BLOCKS_PER_TOKEN: tl.constexpr = hidden_size // BLOCK_SIZE
+
+    num_dispatch_token_cur_rank = tl.load(num_input_tokens_per_rank + rank)
+
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=True, task_type=1)
+
+    for token_idx in range(global_warp_id, num_dispatch_token_cur_rank, total_warps):
+        if scatter_send_barrier_buf is not None:
+            for j in range(topk):
+                topk_index = ld_b32(topk_indices_buf + (token_idx.to(tl.int64) * topk + j))
+                if topk_index < num_experts:  # ignore dropped tokens
+                    if lane_idx == 0:
+                        val = ld_acquire(scatter_send_barrier_buf + (token_idx * topk + j), scope="sys")
+                        while val < 0:
+                            val = ld_acquire(scatter_send_barrier_buf + (token_idx * topk + j), scope="sys")
+            sync_warp()
+
+        # Each lane handles a 16-element FP8 chunk (= 16 bytes = 4 b32) per outer iteration.
+        # NOTE: must use load_v4 / store_v4 (PTX inline asm) and individual fp32 scalars
+        # rather than tl.load(ptr + arange) / tl.store(ptr + arange, vec). The latter form
+        # with a per-lane base pointer is miscompiled by Triton into a warp-collective
+        # shape that drops 15 of every 16 elements (only slot==lane_idx survives), which
+        # has been reproduced in this kernel before this fix landed.
+        for elem_idx in range(lane_idx, hidden_size // FP8_VEC_SIZE, WARP_SIZE):
+            barrier_n_idx = elem_idx * FP8_VEC_SIZE // BLOCK_SIZE
+            base = elem_idx.to(tl.int64) * FP8_VEC_SIZE
+
+            # 16 fp32 scalar accumulators (per lane).
+            a1, a2, a3, a4, a5, a6, a7, a8 = zero_vec_f32(8)
+            a9, a10, a11, a12, a13, a14, a15, a16 = zero_vec_f32(8)
+
+            for j in range(topk):
+                # Load 16 fp8 (4 b32 = 16 bytes) per lane.
+                f1, f2, f3, f4 = load_v4(
+                    scatter_send_buf + (token_idx.to(tl.int64) * topk + j) * hidden_size + base, "b32")
+                # Decode 4 b32 (= 16 fp8 e4m3) -> 16 fp32, preserving byte/element order.
+                u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13, u14, u15, u16 = \
+                    unpack_e4m3_b32x4_f32(f1, f2, f3, f4)
+                # Per-token-per-block scale (fp32 scalar, broadcast across 16 elements).
+                scale = ld_b32(
+                    scatter_send_scale_buf + (token_idx.to(tl.int64) * topk + j) * N_BLOCKS_PER_TOKEN +
+                    barrier_n_idx)
+                a1 += u1 * scale
+                a2 += u2 * scale
+                a3 += u3 * scale
+                a4 += u4 * scale
+                a5 += u5 * scale
+                a6 += u6 * scale
+                a7 += u7 * scale
+                a8 += u8 * scale
+                a9 += u9 * scale
+                a10 += u10 * scale
+                a11 += u11 * scale
+                a12 += u12 * scale
+                a13 += u13 * scale
+                a14 += u14 * scale
+                a15 += u15 * scale
+                a16 += u16 * scale
+
+            # Pack 8 fp32 -> 4 b32 (bf16x2 packed) then store_v4 (= 8 bf16 = 16 bytes).
+            v1, v2, v3, v4 = pack_f32_bf16x2((a1, a2, a3, a4, a5, a6, a7, a8))
+            v5, v6, v7, v8 = pack_f32_bf16x2((a9, a10, a11, a12, a13, a14, a15, a16))
+            out_ptr = output_buf + token_idx.to(tl.int64) * hidden_size + base
+            store_v4(out_ptr, v1, v2, v3, v4, "b32")
+            store_v4(out_ptr + 8, v5, v6, v7, v8, "b32")
+
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=False, task_type=1)
+    return profiler
+
+
+
 @triton_dist.jit(do_not_specialize=["M"])
 def dot_k_const(
     a_ptrs,
@@ -602,6 +831,14 @@ def dot_k_const(
     FP8_BLOCK_K: tl.constexpr,
     need_mask: tl.constexpr,
     USE_FP8: tl.constexpr,
+    # ---- FP8 quantized output extension ----
+    # When OUT_FP8 is True, the fp32 accumulator is quantized to FP8 (block-wise per row,
+    # one scale per BLOCK_SIZE_N tile) before being stored into c_ptrs (FP8 buffer).
+    # The scale (one fp32 per row of this tile) is written to c_scale_ptrs (which already
+    # encodes both the row offset stride_csm and the column block index pid_n).
+    OUT_FP8: tl.constexpr = False,
+    c_scale_ptrs=None,
+    FP8_OUT_MAX: tl.constexpr = 448.0,
 ):
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -626,13 +863,33 @@ def dot_k_const(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    accumulator = accumulator.to(c_ptrs.dtype.element_ty)
-    if need_mask:
-        c_mask = (tl.arange(0, BLOCK_SIZE_M) < M)[:, None] & (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
-        tl.store(c_ptrs, accumulator, mask=c_mask)
+    if OUT_FP8:
+        # row-wise FP8 quantization within this BLOCK_SIZE_N tile.
+        # BLOCK_SIZE_N must be a divisor of FP8 quant block size; we assume the caller
+        # configures BLOCK_SIZE_N == FP8_quant_block_n so each tile produces a single scale per row.
+        eps: tl.constexpr = 1e-12
+        amax = tl.max(tl.abs(accumulator), axis=1)  # [BLOCK_SIZE_M]
+        scale = tl.where(amax > eps, amax / FP8_OUT_MAX, 1.0)
+        q = accumulator / scale[:, None]
+        q = tl.clamp(q, -FP8_OUT_MAX, FP8_OUT_MAX)
+        out = q.to(c_ptrs.dtype.element_ty)
+        if need_mask:
+            c_mask = (tl.arange(0, BLOCK_SIZE_M) < M)[:, None] & (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
+            tl.store(c_ptrs, out, mask=c_mask)
+            scale_mask = tl.arange(0, BLOCK_SIZE_M) < M
+            tl.store(c_scale_ptrs, scale, mask=scale_mask)
+        else:
+            c_mask = (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
+            tl.store(c_ptrs, out, mask=c_mask)
+            tl.store(c_scale_ptrs, scale)
     else:
-        c_mask = (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
-        tl.store(c_ptrs, accumulator, mask=c_mask)
+        accumulator = accumulator.to(c_ptrs.dtype.element_ty)
+        if need_mask:
+            c_mask = (tl.arange(0, BLOCK_SIZE_M) < M)[:, None] & (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
+            tl.store(c_ptrs, accumulator, mask=c_mask)
+        else:
+            c_mask = (tl.arange(0, BLOCK_SIZE_N) < N)[None, :]
+            tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 
@@ -684,6 +941,13 @@ def tile_kernel_moe_grouped_gemm_nk_const(
     IS_DISPATCH_TWO_STAGET: tl.constexpr,
     USE_FP8: tl.constexpr,
     ENABLE_PROFILING: tl.constexpr,
+    # ---- FP8 quantized output extension (combine GEMM only) ----
+    OUT_FP8: tl.constexpr = False,
+    c_scale_ptr=None,
+    stride_csm: tl.constexpr = 0,
+    stride_csn: tl.constexpr = 0,
+    FP8_OUT_BLOCK_N: tl.constexpr = 128,
+    FP8_OUT_MAX: tl.constexpr = 448.0,
 ):
     num_block_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -745,6 +1009,13 @@ def tile_kernel_moe_grouped_gemm_nk_const(
     b_scale_n_group = (pid_n.to(tl.int64) * BLOCK_SIZE_N) // FP8_BLOCK_N
     b_scale_ptrs = b_scale_ptr + expert_id.to(tl.int64) * stride_bse + b_scale_n_group * stride_bsn
 
+    if OUT_FP8:
+        # output scale layout: [M, hidden / FP8_OUT_BLOCK_N], one fp32 per (token, n_block).
+        # BLOCK_SIZE_N must be == FP8_OUT_BLOCK_N for the simple per-tile-per-row scale computation.
+        c_scale_n_group = (pid_n.to(tl.int64) * BLOCK_SIZE_N) // FP8_OUT_BLOCK_N
+        c_scale_ptrs = c_scale_ptr + offs_token * stride_csm + c_scale_n_group * stride_csn
+    else:
+        c_scale_ptrs = c_scale_ptr  # placeholder, not used
 
     if ENABLE_PROFILING:
         profiler = profiler.record(is_start=False, task_type=3)
@@ -753,11 +1024,13 @@ def tile_kernel_moe_grouped_gemm_nk_const(
     if row_remain >= BLOCK_SIZE_M:
         dot_k_const(a_ptrs, b_ptrs, c_ptrs, a_scale_ptrs, b_scale_ptrs, row_remain,
                     min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak, stride_bk, stride_ask, stride_bsk,
-                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, FP8_BLOCK_N, FP8_BLOCK_K, False, USE_FP8)
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, FP8_BLOCK_N, FP8_BLOCK_K, False, USE_FP8,
+                    OUT_FP8=OUT_FP8, c_scale_ptrs=c_scale_ptrs, FP8_OUT_MAX=FP8_OUT_MAX)
     elif row_remain > 0:
         dot_k_const(a_ptrs, b_ptrs, c_ptrs, a_scale_ptrs, b_scale_ptrs, row_remain,
                     min(BLOCK_SIZE_N, N - pid_n * BLOCK_SIZE_N), K, stride_ak, stride_bk, stride_ask, stride_bsk,
-                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, FP8_BLOCK_N, FP8_BLOCK_K, True, USE_FP8)
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, FP8_BLOCK_N, FP8_BLOCK_K, True, USE_FP8,
+                    OUT_FP8=OUT_FP8, c_scale_ptrs=c_scale_ptrs, FP8_OUT_MAX=FP8_OUT_MAX)
 
 
     if ENABLE_PROFILING:
@@ -1182,6 +1455,20 @@ def mega_kernel_moe_grouped_gemm_combine_token(
     profiler_buffer,
     USE_FP8: tl.constexpr,
     ENABLE_PROFILING: tl.constexpr,
+    # ---- FP8 ReduceScatter (FP8 RS) extension ----
+    # When OUT_FP8 is True, the combine GEMM fuses row-wise FP8 quantization (block_n =
+    # FP8_OUT_BLOCK_N == BLOCK_SIZE_N) at the tail of each tile and writes FP8 to c_ptr +
+    # scale to c_scale_ptr. The scatter copies FP8 + scale to scatter_output_(scale_)buf
+    # and topk_reduce dequantizes on the consumer side. input_buf, scatter_output_buf,
+    # input_scale_buf, scatter_output_scale_buf are all FP8/fp32 typed accordingly.
+    OUT_FP8: tl.constexpr = False,
+    c_scale_ptr=None,
+    stride_csm: tl.constexpr = 0,
+    stride_csn: tl.constexpr = 0,
+    input_scale_buf=None,  # symm fp32 [max_tokens, hidden // FP8_OUT_BLOCK_N]
+    scatter_output_scale_buf=None,  # symm fp32 [max_tokens * topk, hidden // FP8_OUT_BLOCK_N]
+    FP8_OUT_BLOCK_N: tl.constexpr = 128,
+    FP8_OUT_MAX: tl.constexpr = 448.0,
 ):
     group_gemm_total_tiles_m = tl.load(num_total_tiles_ptr)
     group_gemm_total_tiles_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -1244,6 +1531,12 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                 USE_BLOCK_WISE_BARRIER=False,
                 USE_FP8=USE_FP8,
                 ENABLE_PROFILING=False,
+                OUT_FP8=OUT_FP8,
+                c_scale_ptr=c_scale_ptr,
+                stride_csm=stride_csm,
+                stride_csn=stride_csn,
+                FP8_OUT_BLOCK_N=FP8_OUT_BLOCK_N,
+                FP8_OUT_MAX=FP8_OUT_MAX,
             )
 
         if ENABLE_PROFILING:
@@ -1342,33 +1635,129 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                     USE_BLOCK_WISE_BARRIER=False,
                     USE_FP8=USE_FP8,
                     ENABLE_PROFILING=ENABLE_PROFILING,
+                    OUT_FP8=OUT_FP8,
+                    c_scale_ptr=c_scale_ptr,
+                    stride_csm=stride_csm,
+                    stride_csn=stride_csn,
+                    FP8_OUT_BLOCK_N=FP8_OUT_BLOCK_N,
+                    FP8_OUT_MAX=FP8_OUT_MAX,
                 )
             elif task_id < num_combine_tasks:
-                profiler = tile_kernel_scatter_token_intra_node(
-                    task_id,
-                    num_combine_tasks,
-                    # counter_ptr, # symm buffer, [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
-                    barriers_ptr,  # symm buffer, per token barrier [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
-                    num_recv_tokens_per_rank,
-                    input_buf,  # symm buffer (recv token in dispatch stage)
-                    scatter_output_buf,  #[max_tokens, topk, hidden]
-                    output_buf,  #[max_tokens, hidden]
-                    gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
-                    gate_output_buf,  # symm buffer [max_tokens, topk]
-                    reversed_token_scatter_idx,  # [max_tokens, topk, 2]
-                    scatter_output_barrier_buf,  # [max_tokens, topk, ]
-                    # non_drop_token_count_buf,  # [max_tokens, ]
+                if OUT_FP8:
+                    profiler = tile_kernel_scatter_token_intra_node_fp8(
+                        task_id,
+                        num_combine_tasks,
+                        barriers_ptr,
+                        num_recv_tokens_per_rank,
+                        input_buf,
+                        input_scale_buf,
+                        scatter_output_buf,
+                        scatter_output_scale_buf,
+                        output_buf,
+                        gate_input_buf,
+                        gate_output_buf,
+                        reversed_token_scatter_idx,
+                        scatter_output_barrier_buf,
+                        hidden_size,
+                        BLOCK_SIZE_N,
+                        HAS_GATE,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
+                else:
+                    profiler = tile_kernel_scatter_token_intra_node(
+                        task_id,
+                        num_combine_tasks,
+                        # counter_ptr, # symm buffer, [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
+                        barriers_ptr,  # symm buffer, per token barrier [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
+                        num_recv_tokens_per_rank,
+                        input_buf,  # symm buffer (recv token in dispatch stage)
+                        scatter_output_buf,  #[max_tokens, topk, hidden]
+                        output_buf,  #[max_tokens, hidden]
+                        gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
+                        gate_output_buf,  # symm buffer [max_tokens, topk]
+                        reversed_token_scatter_idx,  # [max_tokens, topk, 2]
+                        scatter_output_barrier_buf,  # [max_tokens, topk, ]
+                        # non_drop_token_count_buf,  # [max_tokens, ]
+                        hidden_size,
+                        BLOCK_SIZE_N,  # same as group gemm block_size_n
+                        HAS_GATE,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
+            else:  # task_id >= num_combine_tasks + group_gemm_tasks
+                if OUT_FP8:
+                    profiler = tile_kernel_topk_reduce_token_intra_node_fp8(
+                        task_id - num_combine_tasks - group_gemm_tasks,
+                        num_reduce_tasks,
+                        num_input_tokens_per_rank,
+                        scatter_output_buf,
+                        scatter_output_scale_buf,
+                        scatter_output_barrier_buf,
+                        output_buf,
+                        gate_input_buf,
+                        topk_indices_buf,
+                        BLOCK_SIZE_N,
+                        topk,
+                        num_experts,
+                        hidden_size,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
+                else:
+                    profiler = tile_kernel_topk_reduce_token_intra_node(
+                        task_id - num_combine_tasks - group_gemm_tasks,
+                        num_reduce_tasks,
+                        num_input_tokens_per_rank,  # [world_size]
+                        scatter_output_buf,  #[max_tokens, topk, hidden]
+                        scatter_output_barrier_buf,  # [max_tokens, topk, ]
+                        output_buf,  #[max_tokens, hidden]
+                        gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
+                        topk_indices_buf,  # [max_tokens, topk]
+                        BLOCK_SIZE_N,  # same as group gemm block_size_n
+                        topk,
+                        num_experts,
+                        hidden_size,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
+            task_id = tl.atomic_add(task_counter_ptr, 1)
+
+        if scatter_output_barrier_buf is None:
+            rank = dl.rank()
+            world_size = dl.num_ranks()
+            barrier_on_this_grid(grid_barrier_workspace_ptr, False)
+            if sm_id == 0:
+                barrier_all_intra_node_atomic_cas_block(rank, rank, world_size, barrier_all_workspace_ptr)
+            barrier_on_this_grid(grid_barrier_workspace_ptr, False)
+
+            if OUT_FP8:
+                profiler = tile_kernel_topk_reduce_token_intra_node_fp8(
+                    sm_id,
+                    num_sms,
+                    num_input_tokens_per_rank,
+                    scatter_output_buf,
+                    scatter_output_scale_buf,
+                    scatter_output_barrier_buf,
+                    output_buf,
+                    gate_input_buf,
+                    topk_indices_buf,
+                    BLOCK_SIZE_N,
+                    topk,
+                    num_experts,
                     hidden_size,
-                    BLOCK_SIZE_N,  # same as group gemm block_size_n
-                    HAS_GATE,
                     NUM_WARPS,
                     profiler,
                     ENABLE_PROFILING=ENABLE_PROFILING,
                 )
-            else:  # task_id >= num_combine_tasks + group_gemm_tasks
+            else:
                 profiler = tile_kernel_topk_reduce_token_intra_node(
-                    task_id - num_combine_tasks - group_gemm_tasks,
-                    num_reduce_tasks,
+                    sm_id,
+                    num_sms,
                     num_input_tokens_per_rank,  # [world_size]
                     scatter_output_buf,  #[max_tokens, topk, hidden]
                     scatter_output_barrier_buf,  # [max_tokens, topk, ]
@@ -1383,33 +1772,6 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                     profiler,
                     ENABLE_PROFILING=ENABLE_PROFILING,
                 )
-            task_id = tl.atomic_add(task_counter_ptr, 1)
-
-        if scatter_output_barrier_buf is None:
-            rank = dl.rank()
-            world_size = dl.num_ranks()
-            barrier_on_this_grid(grid_barrier_workspace_ptr, False)
-            if sm_id == 0:
-                barrier_all_intra_node_atomic_cas_block(rank, rank, world_size, barrier_all_workspace_ptr)
-            barrier_on_this_grid(grid_barrier_workspace_ptr, False)
-
-            profiler = tile_kernel_topk_reduce_token_intra_node(
-                sm_id,
-                num_sms,
-                num_input_tokens_per_rank,  # [world_size]
-                scatter_output_buf,  #[max_tokens, topk, hidden]
-                scatter_output_barrier_buf,  # [max_tokens, topk, ]
-                output_buf,  #[max_tokens, hidden]
-                gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
-                topk_indices_buf,  # [max_tokens, topk]
-                BLOCK_SIZE_N,  # same as group gemm block_size_n
-                topk,
-                num_experts,
-                hidden_size,
-                NUM_WARPS,
-                profiler,
-                ENABLE_PROFILING=ENABLE_PROFILING,
-            )
 
 
 @triton_dist.jit(do_not_specialize=["M"])

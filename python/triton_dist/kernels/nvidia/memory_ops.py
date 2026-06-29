@@ -228,6 +228,78 @@ def unpack_bf16x2_f32(v1, v2, v3, v4, _semantic=None):
 
 
 @core.extern
+def unpack_e4m3_b32x4_f32(v1, v2, v3, v4, _semantic=None):
+    """Unpack four uint32 values, each holding 4 packed e4m3 FP8 elements
+    (16 elements total), into 16 fp32 outputs.
+
+    Layout per uint32: [b0, b1, b2, b3] (little-endian byte order matching
+    PTX `mov.b32 {b16_lo, b16_hi}` which yields lo=(b1,b0), hi=(b3,b2)).
+    Within each b16, PTX `cvt.rn.f16x2.e4m3x2 fp16x2, b16` produces
+    {f16_low_byte, f16_high_byte} so the resulting f32 outputs are in the
+    same byte order as the original b32 (matches `tl.load` of a contiguous
+    fp8 row when later reinterpreted in fp32)."""
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .b16 b<8>;
+            .reg .b32 h<8>;
+            .reg .b16 t<16>;
+
+            // Each b32 holds 4 fp8 (e4m3). Split into 2 b16 (each = 2 fp8).
+            mov.b32 {b0, b1}, $16;
+            mov.b32 {b2, b3}, $17;
+            mov.b32 {b4, b5}, $18;
+            mov.b32 {b6, b7}, $19;
+
+            // fp8x2 (b16) -> fp16x2 (b32), preserving order.
+            cvt.rn.f16x2.e4m3x2 h0, b0;
+            cvt.rn.f16x2.e4m3x2 h1, b1;
+            cvt.rn.f16x2.e4m3x2 h2, b2;
+            cvt.rn.f16x2.e4m3x2 h3, b3;
+            cvt.rn.f16x2.e4m3x2 h4, b4;
+            cvt.rn.f16x2.e4m3x2 h5, b5;
+            cvt.rn.f16x2.e4m3x2 h6, b6;
+            cvt.rn.f16x2.e4m3x2 h7, b7;
+
+            // Split each f16x2 into 2 f16.
+            mov.b32 {t0, t1}, h0;
+            mov.b32 {t2, t3}, h1;
+            mov.b32 {t4, t5}, h2;
+            mov.b32 {t6, t7}, h3;
+            mov.b32 {t8, t9}, h4;
+            mov.b32 {t10, t11}, h5;
+            mov.b32 {t12, t13}, h6;
+            mov.b32 {t14, t15}, h7;
+
+            // f16 -> f32, output in original element order.
+            cvt.f32.f16 $0,  t0;
+            cvt.f32.f16 $1,  t1;
+            cvt.f32.f16 $2,  t2;
+            cvt.f32.f16 $3,  t3;
+            cvt.f32.f16 $4,  t4;
+            cvt.f32.f16 $5,  t5;
+            cvt.f32.f16 $6,  t6;
+            cvt.f32.f16 $7,  t7;
+            cvt.f32.f16 $8,  t8;
+            cvt.f32.f16 $9,  t9;
+            cvt.f32.f16 $10, t10;
+            cvt.f32.f16 $11, t11;
+            cvt.f32.f16 $12, t12;
+            cvt.f32.f16 $13, t13;
+            cvt.f32.f16 $14, t14;
+            cvt.f32.f16 $15, t15;
+        }
+        """,
+        constraints=("=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r"),
+        args=[v1, v2, v3, v4],
+        dtype=(tl.float32, ) * 16,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
 def pack_f32_bf16x2(vec, _semantic=None):
     v1, v2, v3, v4, v5, v6, v7, v8 = vec
     return tl.inline_asm_elementwise(

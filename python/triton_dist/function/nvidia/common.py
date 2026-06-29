@@ -173,6 +173,7 @@ def triton_dist_ep_op_initialized(ep_implementation: str = "mega"):
 def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_rank, num_experts, ep_size,
                            dtype=torch.bfloat16, weight_dtype=torch.float32, num_sm=8, sm_margin=0, num_buffers=1,
                            capacity=4.0, ep_implementation: str = "mega",  # ["mega", "mega_recomp", "split_mbs"]
+                           enable_fp8_rs: bool = False,
                            ):
     global triton_dist_ep_op
     global triton_dist_ep_op1
@@ -204,16 +205,21 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
             return
         DITRON_EP_STREAM = torch.cuda.Stream()
         MAX_TOKENS_PER_RANK = max_tokens_per_rank
+        # Env-var overrides for FP8 RS tuning of GEMM block sizes / stages.
+        fp8_block_n = int(os.environ.get("TRITON_DIST_FP8_FWD_GEMM_BLOCK_SIZE_N", 128))
+        fp8_block_k = int(os.environ.get("TRITON_DIST_FP8_FWD_GEMM_BLOCK_SIZE_K", 128))
+        fp8_stages = int(os.environ.get("TRITON_DIST_FP8_FWD_GEMM_NUM_STAGES", 4))
         triton_dist_ep_op = EpAll2AllFusedOp(ep_group, max_tokens_per_rank, hidden_size, topk, ep_rank, num_experts,
                                              min(8, ep_size), ep_size, dtype=dtype, weight_dtype=weight_dtype,
                                              num_sm=num_sm, sm_margin=sm_margin, duplicate_comm_buffer=num_buffers,
                                              capacity=capacity, FWD_GEMM_BLOCK_SIZE_N=256,
-                                             FP8_FWD_GEMM_BLOCK_SIZE_N=128,
-                                             FP8_FWD_GEMM_BLOCK_SIZE_K=128,
-                                             FP8_FWD_GEMM_NUM_STAGES=4,
+                                             FP8_FWD_GEMM_BLOCK_SIZE_N=fp8_block_n,
+                                             FP8_FWD_GEMM_BLOCK_SIZE_K=fp8_block_k,
+                                             FP8_FWD_GEMM_NUM_STAGES=fp8_stages,
                                              BF16_FWD_GEMM_BLOCK_SIZE_K=64,
                                              BF16_FWD_GEMM_NUM_STAGES=3,
-                                             need_reversed_token_scatter_idx=True, lazy=True)
+                                             need_reversed_token_scatter_idx=True, lazy=True,
+                                             enable_fp8_rs=enable_fp8_rs)
 
         # Print nvshmem memory requirement before allocation
         if ep_rank == 0:
@@ -422,12 +428,49 @@ class MoEOptimConfig:
     dispatch_use_block_wise_barrier: bool
 
 
-def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
+def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True, is_fp8_rs: bool = False):
     max_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+    # SM/warp 分配 env-var 覆盖。
+    #
+    # 优先级：路径专用 env > 全局 env > 默认值
+    #
+    # - 路径专用：当 `is_fp8_rs=True` 优先读 `TRITON_DIST_FP8RS_*`；
+    #            当 `is_fp8_rs=False`（BF16 RS / D 组）优先读 `TRITON_DIST_BF16RS_*`。
+    # - 全局：`TRITON_DIST_NUM_*` 同时影响 D 和 F 组（向后兼容老脚本）。
+    #
+    # 这样可以让 D/F 两条路径独立调 SM 分配，又不破坏只调一次性能的旧用法。
+    prefix = "FP8RS_" if is_fp8_rs else "BF16RS_"
+
+    def _resolve(name: str):
+        specific = os.environ.get(f"TRITON_DIST_{prefix}{name}")
+        if specific is not None:
+            return specific
+        return os.environ.get(f"TRITON_DIST_{name}")
+
+    env_combine_sms = _resolve("NUM_COMBINE_SMS")
+    env_reduce_sms = _resolve("NUM_REDUCE_SMS_IN_COMBINE")
+    env_combine_warps = _resolve("NUM_COMBINE_WARPS")
+    env_dispatch_sms = _resolve("NUM_DISPATCH_SMS")
+    env_dispatch_warps = _resolve("NUM_DISPATCH_WARPS")
+
+    def _maybe_apply_overrides(cfg: "MoEOptimConfig") -> "MoEOptimConfig":
+        if env_combine_sms is not None:
+            cfg.num_combine_sms = int(env_combine_sms)
+        if env_reduce_sms is not None:
+            cfg.num_reduce_sms_in_combine = int(env_reduce_sms)
+        if env_combine_warps is not None:
+            cfg.num_combine_warps = int(env_combine_warps)
+        if env_dispatch_sms is not None:
+            cfg.num_dispatch_sms = int(env_dispatch_sms)
+        if env_dispatch_warps is not None:
+            cfg.num_dispatch_warps = int(env_dispatch_warps)
+        return cfg
+
     if is_forward:
         if max_sms > 78:  # for H800
             if use_mega:
-                return MoEOptimConfig(
+                return _maybe_apply_overrides(MoEOptimConfig(
                     num_build_sms=8,
                     num_copy_sms=max_sms,
                     num_group_gemm_warps=8,
@@ -438,9 +481,9 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                     num_combine_sms=10,
                     num_reduce_sms_in_combine=80,
                     dispatch_use_block_wise_barrier=True,
-                )
+                ))
             else:
-                return MoEOptimConfig(
+                return _maybe_apply_overrides(MoEOptimConfig(
                     num_build_sms=8,
                     num_copy_sms=max_sms,
                     num_group_gemm_warps=8,
@@ -451,10 +494,10 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                     num_combine_sms=64,
                     num_reduce_sms_in_combine=0,
                     dispatch_use_block_wise_barrier=False,
-                )
+                ))
         else:  # for H20
             print("Warning: H20 is not tuned for forward.")
-            return MoEOptimConfig(
+            return _maybe_apply_overrides(MoEOptimConfig(
                 num_build_sms=8,
                 num_copy_sms=32,
                 num_group_gemm_warps=32,
@@ -465,11 +508,11 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                 num_combine_sms=64,
                 num_reduce_sms_in_combine=0,
                 dispatch_use_block_wise_barrier=False,
-            )
+            ))
     else:  # backward
         if max_sms > 78:  # for H800
             if use_mega:
-                return MoEOptimConfig(
+                return _maybe_apply_overrides(MoEOptimConfig(
                     num_build_sms=8,
                     num_copy_sms=max_sms,
                     num_group_gemm_warps=8,
@@ -480,9 +523,9 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                     num_combine_sms=64,
                     num_reduce_sms_in_combine=100,
                     dispatch_use_block_wise_barrier=True,
-                )
+                ))
             else:
-                return MoEOptimConfig(
+                return _maybe_apply_overrides(MoEOptimConfig(
                     num_build_sms=8,
                     num_copy_sms=max_sms,
                     num_group_gemm_warps=8,
@@ -493,10 +536,10 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                     num_combine_sms=64,
                     num_reduce_sms_in_combine=0,
                     dispatch_use_block_wise_barrier=False,
-                )
+                ))
         else:  # for H20
             print("Warning: H20 is not tuned for backward.")
-            return MoEOptimConfig(
+            return _maybe_apply_overrides(MoEOptimConfig(
                 num_build_sms=8,
                 num_copy_sms=32,
                 num_group_gemm_warps=32,
@@ -507,4 +550,4 @@ def get_moe_optim_config(use_mega: bool = False, is_forward: bool = True):
                 num_combine_sms=64,
                 num_reduce_sms_in_combine=0,
                 dispatch_use_block_wise_barrier=False,
-            )
+            ))

@@ -184,6 +184,8 @@ class FP8_EP_MoE:
             )
 
     def _init_ctx(self, EP_GROUP, max_tokens_per_rank):
+        import os as _os
+        enable_fp8_rs = _os.environ.get("TRITON_DIST_FP8_RS", "0") in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
         init_triton_dist_ep_op(
             EP_GROUP,
             max_tokens_per_rank,
@@ -198,6 +200,7 @@ class FP8_EP_MoE:
 
             num_buffers=1,
             capacity=4.0,
+            enable_fp8_rs=enable_fp8_rs,
         )
         torch.cuda.synchronize()
         if self.world_size > 1:
