@@ -25,7 +25,10 @@
 from triton.language import core
 import triton.language as tl
 from triton_dist.language.core import extern_call
+from triton_dist.language.extra.utils import patch_hash_method_for_pointer_type
 import sys
+
+patch_hash_method_for_pointer_type()
 
 pi_u64_t = tl.core.pointer_type(tl.core.dtype("uint64"))
 pi_i64_t = tl.core.pointer_type(tl.core.dtype("int64"))

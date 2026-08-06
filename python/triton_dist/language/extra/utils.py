@@ -22,9 +22,22 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
+import inspect
 from typing import Dict, Callable, Any
 from functools import wraps
 from triton.language import core
+
+
+def _pointer_type_hash(self):
+    return hash((self.name, self.element_ty, "tt_ptr"))
+
+
+def patch_hash_method_for_pointer_type():
+    # Triton pointer_type defines __eq__ but not __hash__, so dict keys fail.
+    elem_dtype_list = (core.dtype.SINT_TYPES + core.dtype.UINT_TYPES + core.dtype.FP_TYPES + core.dtype.OTHER_TYPES)
+    for elem_dtype in elem_dtype_list:
+        ptr_ty = type(core.pointer_type(core.dtype(elem_dtype)))
+        ptr_ty.__hash__ = _pointer_type_hash
 
 
 class ModuleProxy:
@@ -47,11 +60,23 @@ class ModuleProxy:
         delattr(self._module, name)
 
     def dispatch(self, func: Callable) -> Any:
+        func_signature = inspect.signature(func)
+        parameters = list(func_signature.parameters.values())
+        if "_semantic" not in func_signature.parameters:
+            parameters.append(inspect.Parameter(
+                "_semantic",
+                inspect.Parameter.KEYWORD_ONLY,
+                default=None,
+            ))
 
         @core.builtin
         @wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args, _semantic=None, **kwargs):
             method = getattr(self._module, func.__name__)
+            if "_semantic" in inspect.signature(method).parameters:
+                kwargs["_semantic"] = _semantic
             return method(*args, **kwargs)
+
+        wrapper.__signature__ = func_signature.replace(parameters=parameters)
 
         return wrapper

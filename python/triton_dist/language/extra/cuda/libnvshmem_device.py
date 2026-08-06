@@ -25,24 +25,12 @@
 from triton.language import core
 import triton.language as tl
 from triton_dist.language.core import extern_call
+from triton_dist.language.extra.utils import patch_hash_method_for_pointer_type
 import sys
 
 pi_u64_t = tl.core.pointer_type(tl.core.dtype("uint64"))
 pi_i64_t = tl.core.pointer_type(tl.core.dtype("int64"))
 
-
-def _pointer_type_hash(self):
-    return hash((self.name, self.element_ty, "tt_ptr"))
-
-
-def patch_hash_method_for_pointer_type():
-    elem_dtype_list = tl.core.dtype.SINT_TYPES + tl.core.dtype.UINT_TYPES + tl.core.dtype.FP_TYPES + tl.core.dtype.OTHER_TYPES
-    for elem_dtype in elem_dtype_list:
-        ptr_ty = type(tl.core.pointer_type(tl.core.dtype(elem_dtype)))
-        ptr_ty.__hash__ = _pointer_type_hash
-
-
-# apply monkey patch in runtime
 patch_hash_method_for_pointer_type()
 
 # class nvshmemi_cmp_type(Enum):
